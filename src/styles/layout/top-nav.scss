@@ -1,0 +1,17 @@
+
+
+.top-navigation {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    margin: 25px 15px;
+    img {
+        width: 55px;
+        height: 55px;
+    }
+    span {
+        font-weight: bold;
+        font-size: 22px;
+        color: #FFF;
+    }
+}
