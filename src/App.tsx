@@ -6,8 +6,11 @@ import * as THREE from "three";
 // ═══════════════════════════════════════════════════════════════════
 const ARENA       = 5;
 const HALF        = ARENA / 2;
-const DAMAGE      = 8;
 const BALL_RADIUS = 0.6;
+
+// Change ball movement speed here: these ranges are used when battle rosters spawn.
+const INITIAL_SPEED_XZ: [number, number] = [-3, 3];
+const INITIAL_SPEED_Y:  [number, number] = [-2, 2];
 
 // ── Types ──────────────────────────────────────────────────────────
 type TeamId   = "A" | "B";
@@ -17,6 +20,9 @@ type UnitType =
   | "toxic"     | "machinegunner";
 
 type CameraMode = "FREE" | "TOP" | "SIDE" | "CORNER" | "INSIDE";
+type ProjectileKind = "arrow" | "bullet" | "turret";
+type DamageKind = "projectile" | "melee" | "laser" | "explosion" | "dot";
+type SoundKind = DamageKind | "impact";
 
 // ── Unit definition shapes ─────────────────────────────────────────
 interface SwordsmanDef  { hp:number; radius:number; color:number; swingDmg:number;   orbitR:number;         orbitSpeed:number; }
@@ -29,11 +35,6 @@ interface RecruitDef    { hp:number; radius:number; color:number; spearDmg:numbe
 interface BomberDef     { hp:number; radius:number; color:number; bombInterval:number; bombRadius:number;   bombDmg:number; }
 interface ToxicDef      { hp:number; radius:number; color:number; knifeR:number;     knifeDmg:number;       dotDmg:number; dotDuration:number; }
 interface MachinegunnerDef { hp:number; radius:number; color:number; burstInterval:number; burstCount:number; bulletSpeed:number; bulletDmg:number; bulletSpread:number; }
-
-type UnitDef =
-  | SwordsmanDef | ArcherDef    | LaserDef   | EngineerDef
-  | BarbarianDef | KingDef      | RecruitDef | BomberDef
-  | ToxicDef     | MachinegunnerDef;
 
 interface UnitDefs {
   swordsman:    SwordsmanDef;
@@ -94,6 +95,7 @@ interface Projectile {
   life:  number;
   color: number;
   dot:   { duration: number; dmg: number } | null;
+  kind:  ProjectileKind;
 }
 
 interface Turret {
@@ -123,6 +125,7 @@ interface SimState {
   keys:        Record<string, boolean>;
   collisionFlash: number;
   simRunning:  boolean;
+  lastDamageKind: SoundKind | null;
 }
 
 interface UnitConfig {
@@ -154,6 +157,7 @@ interface PropSet {
   knife:    THREE.Group;
   minigun:  THREE.Group;
   helmet:   THREE.Group;
+  laserGun: THREE.Group;
 }
 
 interface PropEntry {
@@ -224,6 +228,13 @@ function dist3(
   return Math.sqrt(dx * dx + dy * dy + dz * dz);
 }
 
+function applyDamage(unit: Unit, amount: number, kind: DamageKind, onDamage?: (kind: DamageKind) => void): void {
+  if (amount <= 0 || unit.hp <= 0) return;
+  const before = unit.hp;
+  unit.hp = clamp(unit.hp - amount, 0, unit.maxHp);
+  if (unit.hp < before) onDamage?.(kind);
+}
+
 function initUnit(
   x: number, y: number, z: number,
   vx: number, vy: number, vz: number,
@@ -251,7 +262,7 @@ function initUnit(
 }
 
 // ── Physics ──────────────────────────────────────────────────────
-function stepPhysics(balls: Unit[], dt: number): Unit[] {
+function stepPhysics(balls: Unit[], dt: number, onImpact?: () => void): Unit[] {
   const next: Unit[] = balls.map(b => ({ ...b, dots: [...b.dots] }));
 
   for (const b of next) {
@@ -284,8 +295,7 @@ function stepPhysics(balls: Unit[], dt: number): Unit[] {
         if (dot < 0) {
           a.vx += dot * nx; a.vy += dot * ny; a.vz += dot * nz;
           b.vx -= dot * nx; b.vy -= dot * ny; b.vz -= dot * nz;
-          a.hp = clamp(a.hp - DAMAGE, 0, a.maxHp);
-          b.hp = clamp(b.hp - DAMAGE, 0, b.maxHp);
+          onImpact?.();
         }
       }
     }
@@ -296,7 +306,8 @@ function stepPhysics(balls: Unit[], dt: number): Unit[] {
 function stepProjectiles(
   projectiles: Projectile[],
   units:       Unit[],
-  dt:          number
+  dt:          number,
+  onDamage?:   (kind: DamageKind) => void
 ): Projectile[] {
   const next: Projectile[] = projectiles.map(p => ({ ...p })).filter(p => p.life > 0);
 
@@ -310,7 +321,7 @@ function stepProjectiles(
     for (const u of units) {
       if (u.team === p.team || u.hp <= 0) continue;
       if (dist3(u, p) < (u.radius || BALL_RADIUS) + 0.15) {
-        u.hp = clamp(u.hp - p.dmg, 0, u.maxHp);
+        applyDamage(u, p.dmg, "projectile", onDamage);
         if (p.dot) {
           u.dots.push({ remaining: p.dot.duration, dmg: p.dot.dmg, tickTimer: 0 });
         }
@@ -321,14 +332,14 @@ function stepProjectiles(
   return next.filter(p => p.life > 0);
 }
 
-function tickDots(unit: Unit, dt: number): void {
+function tickDots(unit: Unit, dt: number, onDamage?: (kind: DamageKind) => void): void {
   if (!unit.dots || unit.dots.length === 0) return;
   unit.dots = unit.dots.filter(d => d.remaining > 0);
   for (const d of unit.dots) {
     d.tickTimer = (d.tickTimer || 0) + dt;
     if (d.tickTimer >= 1) {
       d.tickTimer -= 1;
-      unit.hp = clamp(unit.hp - d.dmg, 0, unit.maxHp);
+      applyDamage(unit, d.dmg, "dot", onDamage);
     }
     d.remaining -= dt;
   }
@@ -487,6 +498,27 @@ function buildHelmetMesh(): THREE.Group {
   return g;
 }
 
+function buildLaserGunMesh(): THREE.Group {
+  const g = new THREE.Group();
+  const core = new THREE.Mesh(
+    new THREE.BoxGeometry(0.26, 0.14, 0.44),
+    new THREE.MeshStandardMaterial({ color:0x5533ff, emissive:0xff44ff, emissiveIntensity:0.45, metalness:0.75, roughness:0.18 })
+  );
+  const emitter = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.055, 0.07, 0.46, 10),
+    new THREE.MeshStandardMaterial({ color:0xffccff, emissive:0xff44ff, emissiveIntensity:0.8, metalness:0.8, roughness:0.1 })
+  );
+  emitter.rotation.x = Math.PI / 2;
+  emitter.position.z = 0.34;
+  const glow = new THREE.Mesh(
+    new THREE.SphereGeometry(0.09, 10, 8),
+    new THREE.MeshBasicMaterial({ color:0xff44ff, transparent:true, opacity:0.85 })
+  );
+  glow.position.z = 0.6;
+  g.add(core); g.add(emitter); g.add(glow);
+  return g;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  COMPONENT
 // ═══════════════════════════════════════════════════════════════════
@@ -495,7 +527,7 @@ export default function ArenaSim() {
   const stateRef = useRef<SimState>({
     balls: [], projectiles: [], turrets: [], bombs: [],
     camMode: "FREE", yaw: 0, pitch: 0.3, orbitDist: 20,
-    keys: {}, collisionFlash: 0, simRunning: false,
+    keys: {}, collisionFlash: 0, simRunning: false, lastDamageKind: null,
   });
 
   const [hp,         setHp]         = useState<Record<TeamId, number>>({ A: 100, B: 100 });
@@ -532,11 +564,11 @@ export default function ArenaSim() {
     ];
     teamAcfg.forEach((cfg, i) => {
       const p = positions[i] ?? ([rnd(-4,4), 0, rnd(-4,4)] as [number,number,number]);
-      units.push(initUnit(p[0], p[1], p[2], rnd(-3,3), rnd(-2,2), rnd(-3,3), cfg.type, "A", cfg.hp));
+      units.push(initUnit(p[0], p[1], p[2], rnd(...INITIAL_SPEED_XZ), rnd(...INITIAL_SPEED_Y), rnd(...INITIAL_SPEED_XZ), cfg.type, "A", cfg.hp));
     });
     teamBcfg.forEach((cfg, i) => {
       const p = positions[5 + i] ?? ([rnd(-4,4), 0, rnd(-4,4)] as [number,number,number]);
-      units.push(initUnit(p[0], p[1], p[2], rnd(-3,3), rnd(-2,2), rnd(-3,3), cfg.type, "B", cfg.hp));
+      units.push(initUnit(p[0], p[1], p[2], rnd(...INITIAL_SPEED_XZ), rnd(...INITIAL_SPEED_Y), rnd(...INITIAL_SPEED_XZ), cfg.type, "B", cfg.hp));
     });
     return units;
   }, []);
@@ -638,6 +670,7 @@ export default function ArenaSim() {
         knife:    buildKnifeMesh(),
         minigun:  buildMinigunMesh(),
         helmet:   buildHelmetMesh(),
+        laserGun: buildLaserGunMesh(),
       };
       Object.values(props).forEach(p => { container.add(p); p.visible = false; });
       propGroups.push({ container, props });
@@ -654,13 +687,30 @@ export default function ArenaSim() {
     }
 
     // ── Projectile pool ────────────────────────────────────────────
-    const projMeshes: THREE.Mesh[] = [];
+    const projMeshes: THREE.Group[] = [];
     for (let i = 0; i < MAX_PROJ; i++) {
-      const m = new THREE.Mesh(
-        new THREE.SphereGeometry(0.1, 5, 5),
+      const g = new THREE.Group();
+      const arrow = new THREE.Group();
+      arrow.name = "arrow";
+      const shaft = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.025, 0.025, 0.42, 6),
+        new THREE.MeshStandardMaterial({ color:0x8b5a2b, roughness:0.8 })
+      );
+      shaft.rotation.x = Math.PI / 2;
+      const head = new THREE.Mesh(
+        new THREE.ConeGeometry(0.07, 0.18, 8),
+        new THREE.MeshStandardMaterial({ color:0xddeeff, metalness:0.75, roughness:0.2 })
+      );
+      head.rotation.x = Math.PI / 2;
+      head.position.z = 0.3;
+      arrow.add(shaft); arrow.add(head);
+      const bullet = new THREE.Mesh(
+        new THREE.SphereGeometry(0.1, 6, 6),
         new THREE.MeshBasicMaterial({ color:0xffff44, transparent:true, opacity:0.9 })
       );
-      m.visible = false; scene.add(m); projMeshes.push(m);
+      bullet.name = "bullet";
+      g.add(arrow); g.add(bullet);
+      g.visible = false; scene.add(g); projMeshes.push(g);
     }
 
     // ── Turret pool ────────────────────────────────────────────────
@@ -725,6 +775,31 @@ export default function ArenaSim() {
     // ════════════════════════════════════════════════════════════
     let lastTime = performance.now(), globalTime = 0, raf = 0;
 
+    let audioCtx: AudioContext | null = null;
+    const soundCooldowns: Record<SoundKind, number> = { projectile:0, melee:0, laser:0, explosion:0, dot:0, impact:0 };
+    const playDamageSound = (kind: SoundKind) => {
+      const nowSec = performance.now() / 1000;
+      if (nowSec < soundCooldowns[kind]) return;
+      soundCooldowns[kind] = nowSec + (kind === "laser" || kind === "dot" ? 0.22 : 0.08);
+      audioCtx ??= new AudioContext();
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      const filter = audioCtx.createBiquadFilter();
+      const freq: Record<SoundKind, number> = { projectile:720, melee:180, laser:1040, explosion:90, dot:360, impact:260 };
+      const wave: Record<SoundKind, OscillatorType> = { projectile:"triangle", melee:"sawtooth", laser:"square", explosion:"sine", dot:"sine", impact:"triangle" };
+      osc.type = wave[kind];
+      osc.frequency.setValueAtTime(freq[kind], audioCtx.currentTime);
+      if (kind === "explosion") osc.frequency.exponentialRampToValueAtTime(38, audioCtx.currentTime + 0.28);
+      if (kind === "laser") osc.frequency.linearRampToValueAtTime(1320, audioCtx.currentTime + 0.12);
+      filter.type = kind === "explosion" || kind === "impact" ? "lowpass" : "bandpass";
+      filter.frequency.value = kind === "explosion" ? 420 : kind === "impact" ? 700 : 1400;
+      gain.gain.setValueAtTime(kind === "explosion" ? 0.18 : kind === "impact" ? 0.05 : 0.07, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + (kind === "explosion" ? 0.35 : 0.13));
+      osc.connect(filter); filter.connect(gain); gain.connect(audioCtx.destination);
+      osc.start(); osc.stop(audioCtx.currentTime + (kind === "explosion" ? 0.36 : 0.14));
+      stateRef.current.lastDamageKind = kind;
+    };
+
     const animate = () => {
       raf = requestAnimationFrame(animate);
       const now = performance.now();
@@ -757,16 +832,17 @@ export default function ArenaSim() {
 
       // ── Physics ──
       const prev = s.balls;
-      const next = stepPhysics(prev, dt);
+      let anyImpact = false;
+      const next = stepPhysics(prev, dt, () => { anyImpact = true; playDamageSound("impact"); });
 
       // ── Collision flash ──
       const anyHit = prev.some((p, i) => next[i] && p.hp !== next[i].hp);
-      if (anyHit) { s.collisionFlash = 0.35; setColliding(true); setTimeout(() => setColliding(false), 350); }
+      if (anyImpact || anyHit) { s.collisionFlash = 0.35; setColliding(true); setTimeout(() => setColliding(false), 350); }
       if (s.collisionFlash > 0) { s.collisionFlash -= dt; flashMat.opacity = clamp(s.collisionFlash * 1.2, 0, 0.18); }
       else flashMat.opacity = 0;
 
       // ── DOT ticks ──
-      for (const u of next) tickDots(u, dt);
+      for (const u of next) tickDots(u, dt, playDamageSound);
 
       // ── Unit behaviours ────────────────────────────────────────
       const newProj:    Projectile[] = [...s.projectiles];
@@ -785,7 +861,7 @@ export default function ArenaSim() {
             if (e.team === u.team || e.hp <= 0) continue;
             const dx = e.x - wx, dz = e.z - wz;
             if (Math.sqrt(dx * dx + dz * dz) < (e.radius || BALL_RADIUS) + 0.2)
-              e.hp = clamp(e.hp - def.swingDmg * dt, 0, e.maxHp);
+              applyDamage(e, def.swingDmg * dt, "melee", playDamageSound);
           }
         }
 
@@ -800,7 +876,7 @@ export default function ArenaSim() {
             if (e.team === u.team || e.hp <= 0) continue;
             const dx = e.x - wx, dz = e.z - wz;
             if (Math.sqrt(dx * dx + dz * dz) < (e.radius || BALL_RADIUS) + 0.22)
-              e.hp = clamp(e.hp - def.axeDmg * dt, 0, e.maxHp);
+              applyDamage(e, def.axeDmg * dt, "melee", playDamageSound);
           }
         }
 
@@ -820,7 +896,7 @@ export default function ArenaSim() {
                 vx:(dx/d + rnd(-sp,sp)) * def.projSpeed,
                 vy:(dy/d + rnd(0,0.25)) * def.projSpeed,
                 vz:(dz/d + rnd(-sp,sp)) * def.projSpeed,
-                gravity:def.gravity, dmg:def.projDmg, team:u.team, life:3.5, color:TEAM_HEX[u.team], dot:null });
+                gravity:def.gravity, dmg:def.projDmg, team:u.team, life:3.5, color:TEAM_HEX[u.team], dot:null, kind:"arrow" });
             }
           }
         }
@@ -840,7 +916,7 @@ export default function ArenaSim() {
               if (t > 0 && t < 9) {
                 const px = ex - t * rdx, pz = ez - t * rdz;
                 if (Math.sqrt(px*px + pz*pz) < (e.radius || BALL_RADIUS) + 0.28)
-                  e.hp = clamp(e.hp - def.dmgPerSec * dt, 0, e.maxHp);
+                  applyDamage(e, def.dmgPerSec * dt, "laser", playDamageSound);
               }
             }
           }
@@ -864,11 +940,11 @@ export default function ArenaSim() {
           for (const e of next) {
             if (e.team === u.team || e.hp <= 0) continue;
             if (dist3(u, e) < (u.radius || BALL_RADIUS) + (e.radius || BALL_RADIUS) + 0.3)
-              e.hp = clamp(e.hp - def.crownDmg * dt, 0, e.maxHp);
+              applyDamage(e, def.crownDmg * dt, "melee", playDamageSound);
           }
           if (u.lastHpRatio - hpRatio >= def.recruitHpThreshold && spawnUnits.length < 6) {
             u.lastHpRatio = hpRatio;
-            spawnUnits.push(initUnit(u.x + rnd(-1,1), u.y, u.z + rnd(-1,1), rnd(-3,3), 0, rnd(-3,3), "recruit", u.team, 10));
+            spawnUnits.push(initUnit(u.x + rnd(-1,1), u.y, u.z + rnd(-1,1), rnd(...INITIAL_SPEED_XZ), 0, rnd(...INITIAL_SPEED_XZ), "recruit", u.team, 10));
           }
         }
 
@@ -881,7 +957,7 @@ export default function ArenaSim() {
             let nd = Infinity, nt: Unit | null = null;
             for (const e of next) { if (e.team !== u.team && e.hp > 0) { const d = dist3(u, e); if (d < nd) { nd = d; nt = e; } } }
             if (nt && nd < def.spearRange + u.radius)
-              nt.hp = clamp(nt.hp - def.spearDmg, 0, nt.maxHp);
+              applyDamage(nt, def.spearDmg, "melee", playDamageSound);
             if (nt) {
               const dx = nt.x - u.x, dz = nt.z - u.z;
               u.orbitAngle = Math.atan2(dz, dx);
@@ -910,7 +986,7 @@ export default function ArenaSim() {
             if (e.team === u.team || e.hp <= 0) continue;
             const dx = e.x - wx, dz = e.z - wz;
             if (Math.sqrt(dx*dx + dz*dz) < (e.radius || BALL_RADIUS) + 0.18) {
-              e.hp = clamp(e.hp - def.knifeDmg * dt, 0, e.maxHp);
+              applyDamage(e, def.knifeDmg * dt, "melee", playDamageSound);
               if (e.dots.filter(d => d.remaining > 0).length < 3)
                 e.dots.push({ remaining:def.dotDuration, dmg:def.dotDmg, tickTimer:0 });
             }
@@ -941,7 +1017,7 @@ export default function ArenaSim() {
                   vx:(dx/d + rnd(-sp,sp)) * def.bulletSpeed,
                   vy:(dy/d + rnd(-sp*0.5,sp*0.5)) * def.bulletSpeed,
                   vz:(dz/d + rnd(-sp,sp)) * def.bulletSpeed,
-                  gravity:-2, dmg:def.bulletDmg, team:u.team, life:2.5, color:TEAM_HEX[u.team], dot:null });
+                  gravity:-2, dmg:def.bulletDmg, team:u.team, life:2.5, color:TEAM_HEX[u.team], dot:null, kind:"bullet" });
               }
             }
           }
@@ -961,7 +1037,7 @@ export default function ArenaSim() {
             newProj.push({ x:turret.x, y:turret.y + 0.3, z:turret.z,
               vx:Math.cos(ang) * 5, vy:rnd(-0.3,0.4) * 5, vz:Math.sin(ang) * 5,
               gravity:-3, dmg:UNIT_DEFS.engineer.turretProjDmg,
-              team:turret.team, life:2.5, color:TEAM_HEX[turret.team], dot:null });
+              team:turret.team, life:2.5, color:TEAM_HEX[turret.team], dot:null, kind:"turret" });
           }
         }
       }
@@ -978,7 +1054,7 @@ export default function ArenaSim() {
             if (u.hp <= 0) continue;
             const d = dist3(u, bomb);
             if (d < bombDef.bombRadius)
-              u.hp = clamp(u.hp - bombDef.bombDmg * (1 - d / bombDef.bombRadius), 0, u.maxHp);
+              applyDamage(u, bombDef.bombDmg * (1 - d / bombDef.bombRadius), "explosion", playDamageSound);
           }
           const fi = bi % MAX_BOMBS;
           explTimers[fi] = 0.45;
@@ -990,7 +1066,7 @@ export default function ArenaSim() {
       }
       s.bombs = s.bombs.filter(b => b.timer > -1);
 
-      s.projectiles = stepProjectiles(newProj, next, dt);
+      s.projectiles = stepProjectiles(newProj, next, dt, playDamageSound);
       s.balls       = next;
 
       // ── Winner check ──
@@ -1036,6 +1112,8 @@ export default function ArenaSim() {
             const r = UNIT_DEFS.swordsman.orbitR;
             pg.container.position.set(u.x + Math.cos(u.orbitAngle)*r, u.y, u.z + Math.sin(u.orbitAngle)*r);
             pg.container.rotation.y = -u.orbitAngle;
+            props.sword.rotation.y = globalTime * 9;
+            props.sword.rotation.z = Math.sin(globalTime * 8) * 0.35;
             break;
           }
           case "barbarian": {
@@ -1043,13 +1121,17 @@ export default function ArenaSim() {
             const r = UNIT_DEFS.barbarian.axeOrbitR;
             pg.container.position.set(u.x + Math.cos(u.orbitAngle)*r, u.y, u.z + Math.sin(u.orbitAngle)*r);
             pg.container.rotation.y = -u.orbitAngle;
+            props.axe.rotation.z = Math.sin(globalTime * 3) * 0.25;
+            props.axe.rotation.y = globalTime * 2;
             break;
           }
           case "archer": {
             props.bow.visible = true;
             pg.container.position.set(u.x + 0.4, u.y, u.z);
-            const bowPull = Math.sin(globalTime * UNIT_DEFS.archer.fireRate * Math.PI) * 0.08;
-            props.bow.position.x = bowPull;
+            const bowCycle = (globalTime * UNIT_DEFS.archer.fireRate) % 1;
+            const bowPull = (bowCycle < 0.82 ? bowCycle / 0.82 : 1 - (bowCycle - 0.82) / 0.18) * 0.16;
+            props.bow.position.x = -bowPull;
+            props.bow.scale.set(1 + bowPull * 0.35, 1, 1);
             break;
           }
           case "engineer": {
@@ -1094,7 +1176,14 @@ export default function ArenaSim() {
             if (u.burstShotsLeft > 0) props.minigun.rotation.z += 0.3;
             break;
           }
-          case "laser":
+          case "laser": {
+            props.laserGun.visible = true;
+            pg.container.position.set(u.x, u.y + 0.2, u.z);
+            pg.container.rotation.y = -u.orbitAngle;
+            props.laserGun.position.set(0, 0, 0.65);
+            props.laserGun.rotation.z = Math.sin(globalTime * 4) * 0.08;
+            break;
+          }
           default:
             pg.container.visible = false;
         }
@@ -1120,8 +1209,19 @@ export default function ArenaSim() {
       // ── Projectile meshes ──
       for (let i = 0; i < MAX_PROJ; i++) {
         const p = s.projectiles[i], pm = projMeshes[i];
-        if (p) { pm.visible = true; pm.position.set(p.x, p.y, p.z); (pm.material as THREE.MeshBasicMaterial).color.setHex(p.color); }
-        else pm.visible = false;
+        if (p) {
+          pm.visible = true;
+          pm.position.set(p.x, p.y, p.z);
+          pm.lookAt(p.x + p.vx, p.y + p.vy, p.z + p.vz);
+          const arrow = pm.getObjectByName("arrow") as THREE.Group | undefined;
+          const bullet = pm.getObjectByName("bullet") as THREE.Mesh | undefined;
+          if (arrow) arrow.visible = p.kind === "arrow";
+          if (bullet) {
+            bullet.visible = p.kind !== "arrow";
+            (bullet.material as THREE.MeshBasicMaterial).color.setHex(p.color);
+            bullet.scale.setScalar(p.kind === "bullet" ? 0.75 : 1);
+          }
+        } else pm.visible = false;
       }
 
       // ── Turret meshes ──
@@ -1321,12 +1421,12 @@ export default function ArenaSim() {
       {simStarted && !winner && (
         <div style={{ ...panelStyle, top:20, left:20, maxHeight:"calc(100vh - 60px)", overflowY:"auto", minWidth:200 }}>
           <div style={{ color:"#4488ff", fontSize:9, letterSpacing:"0.2em", ...mono, marginBottom:10, textTransform:"uppercase", opacity:0.65 }}>◈ ARENA SIM v3.0</div>
-          <div style={{ color:"#4488ff", fontSize:8, letterSpacing:"0.15em", ...mono, marginBottom:6, opacity:0.45 }}>── TEAM A ──</div>
+          <div style={{ color:"#4488ff", fontSize:8, letterSpacing:"0.15em", ...mono, marginBottom:6, opacity:0.45 }}>── TEAM A · AVG {Math.round(hp.A)} ──</div>
           {unitHps.filter(u => u.team === "A").map((u, i) => (
             <HpBar key={`a${i}`} label={`${TYPE_ICONS[u.type]} ${u.type}`} value={u.hp} maxValue={u.maxHp} color="#4488ff" dots={u.dots}/>
           ))}
           <div style={{ borderTop:"1px solid #0d1a2a", margin:"8px 0" }}/>
-          <div style={{ color:"#ff3344", fontSize:8, letterSpacing:"0.15em", ...mono, marginBottom:6, opacity:0.45 }}>── TEAM B ──</div>
+          <div style={{ color:"#ff3344", fontSize:8, letterSpacing:"0.15em", ...mono, marginBottom:6, opacity:0.45 }}>── TEAM B · AVG {Math.round(hp.B)} ──</div>
           {unitHps.filter(u => u.team === "B").map((u, i) => (
             <HpBar key={`b${i}`} label={`${TYPE_ICONS[u.type]} ${u.type}`} value={u.hp} maxValue={u.maxHp} color="#ff3344" dots={u.dots}/>
           ))}
