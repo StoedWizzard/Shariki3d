@@ -8,8 +8,9 @@ const ARENA       = 5;
 const HALF        = ARENA / 2;
 const BALL_RADIUS = 0.6;
 
-const INITIAL_SPEED_XZ: [number, number] = [-3, 3];
 const INITIAL_SPEED_Y:  [number, number] = [-2, 2];
+const BALL_SPEED = 4.4;
+
 
 type TeamId   = "A" | "B";
 type UnitType =
@@ -20,6 +21,22 @@ type UnitType =
 type ProjectileKind = "arrow" | "bullet" | "turret";
 type DamageKind = "projectile" | "melee" | "laser" | "explosion" | "dot";
 type SoundKind = DamageKind | "impact";
+type EnvironmentType = "forest" | "winter_forest" | "rocky" | "castle";
+type RoomShape = "cube" | "sphere" | "polygon";
+
+interface EnvironmentDef {
+  label: string;
+  description: string;
+}
+
+interface DecorObstacle {
+  x: number;
+  y: number;
+  z: number;
+  radius: number;
+  height: number;
+  kind: "tree" | "bush" | "rock" | "pillar" | "torch";
+}
 
 interface SwordsmanDef  { hp:number; radius:number; color:number; swingDmg:number;   orbitR:number;         orbitSpeed:number; }
 interface ArcherDef     { hp:number; radius:number; color:number; projSpeed:number;  projDmg:number;        fireRate:number; spread:number; gravity:number; }
@@ -114,6 +131,8 @@ interface SimState {
   projectiles: Projectile[];
   turrets:     Turret[];
   bombs:       Bomb[];
+  decor:       DecorObstacle[];
+  roomShape:   RoomShape;
   yaw:         number;
   pitch:       number;
   orbitDist:   number;
@@ -147,6 +166,20 @@ const UNIT_DEFS: UnitDefs = {
   bomber:       { hp:90,  radius:BALL_RADIUS,        color:0xff8800, bombInterval:3, bombRadius:3, bombDmg:20 },
   toxic:        { hp:110, radius:BALL_RADIUS,        color:0x44ff88, knifeR:1.1,   knifeDmg:2,  dotDmg:1, dotDuration:5 },
   machinegunner:{ hp:140, radius:BALL_RADIUS,        color:0xcc88ff, burstInterval:3, burstCount:4, bulletSpeed:12, bulletDmg:8, bulletSpread:0.22 },
+};
+
+
+const ENVIRONMENT_DEFS: Record<EnvironmentType, EnvironmentDef> = {
+  forest: { label:"Лес", description:"деревья, кусты и трава вокруг арены" },
+  winter_forest: { label:"Зимний лес", description:"снег, ели и сугробы" },
+  rocky: { label:"Каменистая поверхность", description:"скалы, валуны и горные плиты" },
+  castle: { label:"Замок", description:"каменный зал, колонны и яркие факелы" },
+};
+
+const ROOM_SHAPE_DEFS: Record<RoomShape, string> = {
+  cube: "Кубическое помещение",
+  sphere: "Шарообразное помещение",
+  polygon: "Многоугольное помещение",
 };
 
 const TEAM_CSS: Record<TeamId, string>  = { A:"#4488ff", B:"#ff3344" };
@@ -198,6 +231,32 @@ function applyDamage(unit: Unit, amount: number, kind: DamageKind, onDamage?: (k
   if (unit.hp < before) onDamage?.(kind);
 }
 
+
+function normalizeUnitSpeed(unit: Unit, speed = BALL_SPEED): void {
+  const current = Math.sqrt(unit.vx * unit.vx + unit.vy * unit.vy + unit.vz * unit.vz);
+  if (current < 0.0001) {
+    const a = rnd(0, Math.PI * 2);
+    unit.vx = Math.cos(a) * speed;
+    unit.vy = rnd(-0.35, 0.35) * speed;
+    unit.vz = Math.sin(a) * speed;
+    normalizeUnitSpeed(unit, speed);
+    return;
+  }
+  const k = speed / current;
+  unit.vx *= k; unit.vy *= k; unit.vz *= k;
+}
+
+function randomVelocity(speed = BALL_SPEED): [number, number, number] {
+  const a = rnd(0, Math.PI * 2);
+  const vy = rnd(...INITIAL_SPEED_Y);
+  const horizontal = Math.sqrt(Math.max(speed * speed - vy * vy, speed * speed * 0.45));
+  return [Math.cos(a) * horizontal, vy, Math.sin(a) * horizontal];
+}
+
+function polygonApothem(sides: number): number {
+  return Math.cos(Math.PI / sides) * HALF;
+}
+
 function initUnit(
   x: number, y: number, z: number,
   vx: number, vy: number, vz: number,
@@ -207,7 +266,7 @@ function initUnit(
 ): Unit {
   const def = UNIT_DEFS[type];
   const hp  = customHp ?? def.hp;
-  return {
+  const unit: Unit = {
     x, y, z, vx, vy, vz,
     hp, maxHp: hp,
     color: TEAM_HEX[team],
@@ -222,22 +281,100 @@ function initUnit(
     dots: [],
     alive: true,
   };
+  normalizeUnitSpeed(unit);
+  return unit;
 }
 
-function stepPhysics(balls: Unit[], dt: number, onImpact?: () => void): Unit[] {
+function generateDecorObstacles(environment: EnvironmentType): DecorObstacle[] {
+  const base: DecorObstacle[] = [];
+  const addRing = (kind: DecorObstacle["kind"], radius: number, height: number, count: number, jitter = 0.25) => {
+    const seed = environment.length + kind.length;
+    for (let i = 0; i < count; i++) {
+      const wobble = Math.sin((i + 1) * (seed + 0.73)) * 0.12;
+      const a = (i / count) * Math.PI * 2 + wobble;
+      const r = HALF - 0.45 - Math.abs(Math.cos((i + 1) * (seed + 1.91))) * jitter;
+      base.push({ x: Math.cos(a) * r, y: -HALF + height / 2, z: Math.sin(a) * r, radius, height, kind });
+    }
+  };
+  if (environment === "forest") {
+    addRing("tree", 0.24, 1.9, 10);
+    addRing("bush", 0.28, 0.45, 8, 0.45);
+  } else if (environment === "winter_forest") {
+    addRing("tree", 0.26, 2.05, 11);
+    addRing("bush", 0.32, 0.42, 7, 0.45);
+  } else if (environment === "rocky") {
+    addRing("rock", 0.36, 0.7, 13, 0.5);
+  } else {
+    addRing("pillar", 0.28, ARENA, 8, 0.25);
+    addRing("torch", 0.18, 1.25, 6, 0.2);
+  }
+  return base;
+}
+
+function resolveDecorCollision(unit: Unit, obstacle: DecorObstacle, onImpact?: () => void): void {
+  const dx = unit.x - obstacle.x, dz = unit.z - obstacle.z;
+  const dist = Math.sqrt(dx * dx + dz * dz);
+  const minD = unit.radius + obstacle.radius;
+  if (dist >= minD || dist < 0.0001 || unit.y < -HALF - unit.radius || unit.y > obstacle.y + obstacle.height / 2 + unit.radius) return;
+  const nx = dx / dist, nz = dz / dist;
+  unit.x = obstacle.x + nx * minD;
+  unit.z = obstacle.z + nz * minD;
+  const dot = unit.vx * nx + unit.vz * nz;
+  if (dot < 0) {
+    unit.vx -= 2 * dot * nx;
+    unit.vz -= 2 * dot * nz;
+    onImpact?.();
+  }
+}
+
+function resolveRoomCollision(unit: Unit, roomShape: RoomShape, onImpact?: () => void): void {
+  const r = unit.radius || BALL_RADIUS;
+  if (roomShape === "sphere") {
+    const limit = HALF - r;
+    const d = Math.sqrt(unit.x * unit.x + unit.y * unit.y + unit.z * unit.z);
+    if (d > limit && d > 0.0001) {
+      const nx = unit.x / d, ny = unit.y / d, nz = unit.z / d;
+      unit.x = nx * limit; unit.y = ny * limit; unit.z = nz * limit;
+      const dot = unit.vx * nx + unit.vy * ny + unit.vz * nz;
+      if (dot > 0) { unit.vx -= 2 * dot * nx; unit.vy -= 2 * dot * ny; unit.vz -= 2 * dot * nz; onImpact?.(); }
+    }
+    return;
+  }
+  const lim = HALF - r;
+  if (unit.y >  lim) { unit.y =  lim; unit.vy = -Math.abs(unit.vy); onImpact?.(); }
+  if (unit.y < -lim) { unit.y = -lim; unit.vy =  Math.abs(unit.vy); onImpact?.(); }
+  if (roomShape === "polygon") {
+    const sides = 8;
+    const apothem = polygonApothem(sides) - r;
+    for (let i = 0; i < sides; i++) {
+      const a = i * Math.PI * 2 / sides + Math.PI / sides;
+      const nx = Math.cos(a), nz = Math.sin(a);
+      const signed = unit.x * nx + unit.z * nz;
+      if (signed > apothem) {
+        const over = signed - apothem;
+        unit.x -= nx * over; unit.z -= nz * over;
+        const dot = unit.vx * nx + unit.vz * nz;
+        if (dot > 0) { unit.vx -= 2 * dot * nx; unit.vz -= 2 * dot * nz; onImpact?.(); }
+      }
+    }
+    return;
+  }
+  if (unit.x >  lim) { unit.x =  lim; unit.vx = -Math.abs(unit.vx); onImpact?.(); }
+  if (unit.x < -lim) { unit.x = -lim; unit.vx =  Math.abs(unit.vx); onImpact?.(); }
+  if (unit.z >  lim) { unit.z =  lim; unit.vz = -Math.abs(unit.vz); onImpact?.(); }
+  if (unit.z < -lim) { unit.z = -lim; unit.vz =  Math.abs(unit.vz); onImpact?.(); }
+}
+
+function stepPhysics(balls: Unit[], dt: number, roomShape: RoomShape, decor: DecorObstacle[], onImpact?: () => void): Unit[] {
   const next: Unit[] = balls.map(b => ({ ...b, dots: [...b.dots] }));
 
   for (const b of next) {
     b.x += b.vx * dt; b.y += b.vy * dt; b.z += b.vz * dt;
   }
   for (const b of next) {
-    const r = b.radius || BALL_RADIUS, lim = HALF - r;
-    if (b.x >  lim) { b.x =  lim; b.vx = -Math.abs(b.vx); }
-    if (b.x < -lim) { b.x = -lim; b.vx =  Math.abs(b.vx); }
-    if (b.y >  lim) { b.y =  lim; b.vy = -Math.abs(b.vy); }
-    if (b.y < -lim) { b.y = -lim; b.vy =  Math.abs(b.vy); }
-    if (b.z >  lim) { b.z =  lim; b.vz = -Math.abs(b.vz); }
-    if (b.z < -lim) { b.z = -lim; b.vz =  Math.abs(b.vz); }
+    resolveRoomCollision(b, roomShape, onImpact);
+    for (const obstacle of decor) resolveDecorCollision(b, obstacle, onImpact);
+    normalizeUnitSpeed(b);
   }
 
   for (let i = 0; i < next.length; i++) {
@@ -259,9 +396,12 @@ function stepPhysics(balls: Unit[], dt: number, onImpact?: () => void): Unit[] {
           b.vx -= dot * nx; b.vy -= dot * ny; b.vz -= dot * nz;
           onImpact?.();
         }
+        normalizeUnitSpeed(a);
+        normalizeUnitSpeed(b);
       }
     }
   }
+  for (const b of next) normalizeUnitSpeed(b);
   return next;
 }
 
@@ -488,7 +628,17 @@ function buildBowMesh(): THREE.Group {
   );
   arrowTip.rotation.x = Math.PI / 2;
   arrowTip.position.set(0, 0, 0.36);
-  g.add(bow); g.add(string); g.add(arrowShaft); g.add(arrowTip);
+  const fletching = new THREE.Group();
+  for (let i = 0; i < 3; i++) {
+    const feather = new THREE.Mesh(
+      new THREE.BoxGeometry(0.018, 0.09, 0.045),
+      new THREE.MeshStandardMaterial({ color:i === 0 ? 0xffffff : 0x77cc44, roughness:0.65 })
+    );
+    feather.position.set(Math.cos(i * Math.PI * 2 / 3) * 0.035, Math.sin(i * Math.PI * 2 / 3) * 0.035, -0.25);
+    feather.rotation.z = i * Math.PI * 2 / 3;
+    fletching.add(feather);
+  }
+  g.add(bow); g.add(string); g.add(arrowShaft); g.add(arrowTip); g.add(fletching);
   return g;
 }
 
@@ -911,6 +1061,135 @@ function buildTurretMesh(teamColor: number): THREE.Group {
   return g;
 }
 
+
+function createDecorMesh(obstacle: DecorObstacle, environment: EnvironmentType): THREE.Group {
+  const g = new THREE.Group();
+  g.position.set(obstacle.x, -HALF, obstacle.z);
+  const winter = environment === "winter_forest";
+  if (obstacle.kind === "tree") {
+    const trunk = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.08, 0.12, obstacle.height * 0.55, 8),
+      new THREE.MeshStandardMaterial({ color:0x5a3218, roughness:0.95 })
+    );
+    trunk.position.y = obstacle.height * 0.28;
+    g.add(trunk);
+    for (let i = 0; i < 3; i++) {
+      const crown = new THREE.Mesh(
+        new THREE.ConeGeometry(0.42 - i * 0.08, 0.62, 10),
+        new THREE.MeshStandardMaterial({ color:winter ? 0xdff6ff : 0x0d6b2a, emissive:winter ? 0x88ccff : 0x063d19, emissiveIntensity:0.18, roughness:0.8 })
+      );
+      crown.position.y = obstacle.height * (0.43 + i * 0.18);
+      g.add(crown);
+    }
+  } else if (obstacle.kind === "bush") {
+    const colors = winter ? [0xf4fbff, 0xcfeeff, 0xffffff] : [0x1a8c38, 0x2fb34b, 0x0f5f28];
+    for (let i = 0; i < 4; i++) {
+      const m = new THREE.Mesh(
+        new THREE.SphereGeometry(obstacle.radius * rnd(0.7, 1.05), 9, 7),
+        new THREE.MeshStandardMaterial({ color:colors[i % colors.length], roughness:0.82, emissive:colors[i % colors.length], emissiveIntensity:0.08 })
+      );
+      m.position.set(rnd(-0.16, 0.16), obstacle.height * 0.45 + rnd(-0.04, 0.1), rnd(-0.16, 0.16));
+      g.add(m);
+    }
+  } else if (obstacle.kind === "rock") {
+    const rock = new THREE.Mesh(
+      new THREE.DodecahedronGeometry(obstacle.radius, 0),
+      new THREE.MeshStandardMaterial({ color:0x77746c, roughness:0.96, metalness:0.05, emissive:0x242220, emissiveIntensity:0.15 })
+    );
+    rock.scale.set(1.2, obstacle.height / obstacle.radius, 0.9);
+    rock.position.y = obstacle.height * 0.5;
+    g.add(rock);
+  } else if (obstacle.kind === "pillar") {
+    const pillar = new THREE.Mesh(
+      new THREE.CylinderGeometry(obstacle.radius, obstacle.radius * 1.12, obstacle.height, 14),
+      new THREE.MeshStandardMaterial({ color:0x858087, roughness:0.7, metalness:0.1, emissive:0x2a2730, emissiveIntensity:0.18 })
+    );
+    pillar.position.y = obstacle.height / 2;
+    g.add(pillar);
+    [-0.18, obstacle.height + 0.18].forEach(y => {
+      const cap = new THREE.Mesh(new THREE.BoxGeometry(0.72, 0.18, 0.72), new THREE.MeshStandardMaterial({ color:0x6d6870, roughness:0.78 }));
+      cap.position.y = y;
+      g.add(cap);
+    });
+  } else {
+    const stand = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.06, obstacle.height, 8), new THREE.MeshStandardMaterial({ color:0x2b1a10, metalness:0.5, roughness:0.35 }));
+    stand.position.y = obstacle.height * 0.5;
+    const flame = new THREE.Mesh(new THREE.ConeGeometry(0.16, 0.38, 8), new THREE.MeshBasicMaterial({ color:0xffaa22, transparent:true, opacity:0.95 }));
+    flame.position.y = obstacle.height + 0.25;
+    g.add(stand); g.add(flame);
+  }
+  return g;
+}
+
+function createEnvironmentGroup(environment: EnvironmentType, decor: DecorObstacle[]): THREE.Group {
+  const g = new THREE.Group();
+  const isWinter = environment === "winter_forest";
+  const floorColor = environment === "castle" ? 0x3c3840 : environment === "rocky" ? 0x5f5b50 : isWinter ? 0xe8f7ff : 0x17351d;
+  const floor = new THREE.Mesh(
+    new THREE.CircleGeometry(HALF * 1.58, 64),
+    new THREE.MeshStandardMaterial({ color:floorColor, roughness:0.92, metalness: environment === "castle" ? 0.05 : 0, emissive:floorColor, emissiveIntensity:0.09 })
+  );
+  floor.rotation.x = -Math.PI / 2;
+  floor.position.y = -HALF - 0.02;
+  floor.receiveShadow = true;
+  g.add(floor);
+
+  if (environment === "forest" || environment === "winter_forest") {
+    for (let i = 0; i < 90; i++) {
+      const blade = new THREE.Mesh(
+        new THREE.ConeGeometry(0.015, rnd(0.12, 0.3), 4),
+        new THREE.MeshStandardMaterial({ color:isWinter ? 0xf7ffff : 0x3aa64b, emissive:isWinter ? 0xaadfff : 0x124d20, emissiveIntensity:0.12 })
+      );
+      const a = rnd(0, Math.PI * 2), r = rnd(0.2, HALF * 1.45);
+      blade.position.set(Math.cos(a) * r, -HALF + 0.05, Math.sin(a) * r);
+      blade.rotation.z = rnd(-0.28, 0.28);
+      g.add(blade);
+    }
+  }
+
+  if (environment === "rocky") {
+    for (let i = 0; i < 18; i++) {
+      const ridge = new THREE.Mesh(new THREE.DodecahedronGeometry(rnd(0.14, 0.38), 0), new THREE.MeshStandardMaterial({ color:0x6d6a62, roughness:0.98, emissive:0x171615, emissiveIntensity:0.12 }));
+      const a = rnd(0, Math.PI * 2), r = rnd(1.2, HALF * 1.45);
+      ridge.position.set(Math.cos(a) * r, -HALF + rnd(0.03, 0.26), Math.sin(a) * r);
+      ridge.scale.y = rnd(0.45, 1.8);
+      g.add(ridge);
+    }
+  }
+
+  if (environment === "castle") {
+    for (let x = -2; x <= 2; x++) {
+      for (let z = -2; z <= 2; z++) {
+        const tile = new THREE.Mesh(new THREE.BoxGeometry(0.86, 0.03, 0.86), new THREE.MeshStandardMaterial({ color:(x + z) % 2 ? 0x4a4650 : 0x302d35, roughness:0.72 }));
+        tile.position.set(x * 0.9, -HALF + 0.005, z * 0.9);
+        g.add(tile);
+      }
+    }
+  }
+
+  decor.forEach(o => g.add(createDecorMesh(o, environment)));
+  return g;
+}
+
+function createRoomMesh(roomShape: RoomShape): THREE.Object3D {
+  if (roomShape === "sphere") {
+    return new THREE.Mesh(new THREE.SphereGeometry(HALF, 32, 18), new THREE.MeshBasicMaterial({ color:0x66aaff, wireframe:true, transparent:true, opacity:0.24 }));
+  }
+  if (roomShape === "polygon") {
+    const shape = new THREE.Shape();
+    const sides = 8;
+    for (let i = 0; i <= sides; i++) {
+      const a = i * Math.PI * 2 / sides + Math.PI / sides;
+      const x = Math.cos(a) * HALF, y = Math.sin(a) * HALF;
+      if (i === 0) shape.moveTo(x, y); else shape.lineTo(x, y);
+    }
+    const geo = new THREE.ExtrudeGeometry(shape, { depth: ARENA, bevelEnabled:false });
+    geo.center();
+    return new THREE.LineSegments(new THREE.EdgesGeometry(geo), new THREE.LineBasicMaterial({ color:0x55ddff, transparent:true, opacity:0.75 }));
+  }
+  return new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(ARENA, ARENA, ARENA)), new THREE.LineBasicMaterial({ color:0x66aaff }));
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  COMPONENT
 // ═══════════════════════════════════════════════════════════════════
@@ -918,6 +1197,7 @@ export default function ArenaSim() {
   const mountRef = useRef<HTMLDivElement>(null);
   const stateRef = useRef<SimState>({
     balls: [], projectiles: [], turrets: [], bombs: [],
+    decor: generateDecorObstacles("forest"), roomShape: "cube",
     yaw: 0, pitch: 0.3, orbitDist: 20,
     keys: {}, collisionFlash: 0, simRunning: false, lastDamageKind: null,
   });
@@ -929,6 +1209,9 @@ export default function ArenaSim() {
   const [winner,     setWinner]      = useState<string | null>(null);
   const [unitHps,    setUnitHps]     = useState<UnitHpInfo[]>([]);
   const [configPhase,setConfigPhase] = useState(true);
+  const [environment, setEnvironment] = useState<EnvironmentType>("forest");
+  const [roomShape, setRoomShape] = useState<RoomShape>("cube");
+  const [teamNames, setTeamNames] = useState<Record<TeamId, string>>({ A:"Team Name 1", B:"Team Name 2" });
   const winnerRef = useRef<string | null>(null);
 
   const [teamA, setTeamA] = useState<UnitConfig[]>([
@@ -945,21 +1228,23 @@ export default function ArenaSim() {
   const buildRoster = useCallback((teamAcfg: UnitConfig[], teamBcfg: UnitConfig[]): Unit[] => {
     const units: Unit[] = [];
     const positions: [number, number, number][] = [
-      [-3.5,0,-3.5],[-2,0,-3],[-3.5,0,0],[-2,0,3],[-3.5,0,3.5],
-      [3.5,0,3.5],[2,0,3],[3.5,0,0],[2,0,-3],[3.5,0,-3.5],
+      [-1.55,0,-1.55],[-0.8,0,-1.25],[-1.55,0,0],[-0.8,0,1.25],[-1.55,0,1.55],
+      [1.55,0,1.55],[0.8,0,1.25],[1.55,0,0],[0.8,0,-1.25],[1.55,0,-1.55],
     ];
     teamAcfg.forEach((cfg, i) => {
-      const p = positions[i] ?? ([rnd(-4,4), 0, rnd(-4,4)] as [number,number,number]);
-      units.push(initUnit(p[0], p[1], p[2], rnd(...INITIAL_SPEED_XZ), rnd(...INITIAL_SPEED_Y), rnd(...INITIAL_SPEED_XZ), cfg.type, "A", cfg.hp));
+      const p = positions[i] ?? ([rnd(-1.6,1.6), 0, rnd(-1.6,1.6)] as [number,number,number]);
+      const [vx, vy, vz] = randomVelocity();
+      units.push(initUnit(p[0], p[1], p[2], vx, vy, vz, cfg.type, "A", cfg.hp));
     });
     teamBcfg.forEach((cfg, i) => {
-      const p = positions[5 + i] ?? ([rnd(-4,4), 0, rnd(-4,4)] as [number,number,number]);
-      units.push(initUnit(p[0], p[1], p[2], rnd(...INITIAL_SPEED_XZ), rnd(...INITIAL_SPEED_Y), rnd(...INITIAL_SPEED_XZ), cfg.type, "B", cfg.hp));
+      const p = positions[5 + i] ?? ([rnd(-1.6,1.6), 0, rnd(-1.6,1.6)] as [number,number,number]);
+      const [vx, vy, vz] = randomVelocity();
+      units.push(initUnit(p[0], p[1], p[2], vx, vy, vz, cfg.type, "B", cfg.hp));
     });
     return units;
   }, []);
 
-  const startCountdown = useCallback(() => {
+  const startCountdown = () => {
     setConfigPhase(false); setSimStarted(false);
     winnerRef.current = null; setWinner(null);
     const s = stateRef.current;
@@ -967,6 +1252,8 @@ export default function ArenaSim() {
     s.projectiles = [];
     s.turrets     = [];
     s.bombs       = [];
+    s.decor       = generateDecorObstacles(environment);
+    s.roomShape   = roomShape;
     s.simRunning  = false;
     let c = 5; setCountdown(c);
     const iv = setInterval(() => {
@@ -974,7 +1261,7 @@ export default function ArenaSim() {
       if (c <= 0) { clearInterval(iv); setCountdown(0); setSimStarted(true); s.simRunning = true; }
       else setCountdown(c);
     }, 1000);
-  }, [teamA, teamB, buildRoster]);
+  };
 
   // ─────────────────────────────────────────────────────────────────
   //  THREE.JS SETUP
@@ -993,26 +1280,31 @@ export default function ArenaSim() {
     el.appendChild(renderer.domElement);
 
     const scene = new THREE.Scene();
-    scene.fog = new THREE.FogExp2(0x050508, 0.035);
+    const bgColor = environment === "winter_forest" ? 0x142536 : environment === "castle" ? 0x08070a : environment === "rocky" ? 0x12110f : 0x071109;
+    renderer.setClearColor(bgColor);
+    scene.fog = new THREE.FogExp2(bgColor, environment === "castle" ? 0.025 : 0.032);
 
     const camera = new THREE.PerspectiveCamera(70, W() / H(), 0.1, 200);
     camera.position.set(0, 5, 20); camera.lookAt(0, 0, 0);
 
-    scene.add(new THREE.AmbientLight(0x112233, 1.5));
-    const dirLight = new THREE.DirectionalLight(0xffffff, 2);
+    scene.add(new THREE.AmbientLight(0xffffff, 2.15));
+    const hemi = new THREE.HemisphereLight(0xffffff, environment === "winter_forest" ? 0xbbeeff : 0x334422, 1.35);
+    scene.add(hemi);
+    const dirLight = new THREE.DirectionalLight(0xffffff, 3.25);
     dirLight.position.set(8, 12, 8); dirLight.castShadow = true;
     scene.add(dirLight);
-    const ptA = new THREE.PointLight(0x4488ff, 3, 14); scene.add(ptA);
-    const ptB = new THREE.PointLight(0xff3344, 3, 14); scene.add(ptB);
+    const ptA = new THREE.PointLight(0x4488ff, 4.8, 18); scene.add(ptA);
+    const ptB = new THREE.PointLight(0xff3344, 4.8, 18); scene.add(ptB);
+    const topLight = new THREE.PointLight(0xffffff, 4.2, 24);
+    topLight.position.set(0, 5.5, 0); scene.add(topLight);
 
-    const arenaGeo = new THREE.BoxGeometry(ARENA, ARENA, ARENA);
-    scene.add(new THREE.Mesh(arenaGeo, new THREE.MeshBasicMaterial({ color:0x223355, wireframe:true, transparent:true, opacity:0.3 })));
-    const grid = new THREE.GridHelper(ARENA, 10, 0x1a2a4a, 0x0d1525);
-    grid.position.y = -HALF + 0.01; scene.add(grid);
-    scene.add(new THREE.LineSegments(
-      new THREE.EdgesGeometry(arenaGeo),
-      new THREE.LineBasicMaterial({ color:0x3366cc })
-    ));
+    const visualDecor = generateDecorObstacles(environment);
+    stateRef.current.decor = visualDecor;
+    stateRef.current.roomShape = roomShape;
+    scene.add(createEnvironmentGroup(environment, visualDecor));
+    scene.add(createRoomMesh(roomShape));
+    const grid = new THREE.GridHelper(ARENA, 10, environment === "castle" ? 0xc4a66a : 0x4d8cff, 0x17243a);
+    grid.position.y = -HALF + 0.015; scene.add(grid);
 
     // ── Unit body mesh pool ────────────────────────────────────────
     const ballMeshes: THREE.Mesh[]                 = [];
@@ -1059,7 +1351,7 @@ export default function ArenaSim() {
     // Store built meshes per unit to avoid rebuilding every frame
     const builtOutfits: Map<number, { type: UnitType; cracked: boolean; tartanRatio: number }> = new Map();
 
-    function rebuildUnitVisuals(idx: number, u: Unit, globalTime: number) {
+    function rebuildUnitVisuals(idx: number, u: Unit) {
       const vis = unitVisuals[idx];
       const hpRatio = u.hp / u.maxHp;
       const cacheKey = { type: u.type, cracked: hpRatio <= 0.5, tartanRatio: Math.floor(hpRatio * 5) };
@@ -1306,7 +1598,7 @@ export default function ArenaSim() {
       // ── Physics ──
       const prev = s.balls;
       let anyImpact = false;
-      const next = stepPhysics(prev, dt, () => { anyImpact = true; playDamageSound("impact"); });
+      const next = stepPhysics(prev, dt, s.roomShape, s.decor, () => { anyImpact = true; playDamageSound("impact"); });
 
       const anyHit = prev.some((p, i) => next[i] && p.hp !== next[i].hp);
       if (anyImpact || anyHit) { s.collisionFlash = 0.35; setColliding(true); setTimeout(() => setColliding(false), 350); }
@@ -1436,7 +1728,8 @@ export default function ArenaSim() {
           }
           if (u.lastHpRatio - hpRatio >= def.recruitHpThreshold && spawnUnits.length < 6) {
             u.lastHpRatio = hpRatio;
-            spawnUnits.push(initUnit(u.x + rnd(-1,1), u.y, u.z + rnd(-1,1), rnd(...INITIAL_SPEED_XZ), 0, rnd(...INITIAL_SPEED_XZ), "recruit", u.team, 10));
+            const [rvx, rvy, rvz] = randomVelocity();
+            spawnUnits.push(initUnit(u.x + rnd(-0.7,0.7), u.y, u.z + rnd(-0.7,0.7), rvx, rvy, rvz, "recruit", u.team, 10));
           }
         }
 
@@ -1563,7 +1856,7 @@ export default function ArenaSim() {
         const aAlive = next.filter(u => u.team === "A" && u.hp > 0).length;
         const bAlive = next.filter(u => u.team === "B" && u.hp > 0).length;
         if (aAlive === 0 || bAlive === 0) {
-          const w = aAlive === 0 && bAlive === 0 ? "DRAW" : aAlive === 0 ? "TEAM B WINS" : "TEAM A WINS";
+          const w = aAlive === 0 && bAlive === 0 ? "DRAW" : aAlive === 0 ? `Subscribe on ${teamNames.B} Win` : `Like on ${teamNames.A} Win`;
           winnerRef.current = w; setWinner(w); s.simRunning = false;
         }
       }
@@ -1598,7 +1891,7 @@ export default function ArenaSim() {
         }
 
         // Rebuild visuals if needed (lazy rebuild)
-        rebuildUnitVisuals(i, u, globalTime);
+        rebuildUnitVisuals(i, u);
 
         const hpRatio = u.hp / u.maxHp;
 
@@ -1659,12 +1952,12 @@ export default function ArenaSim() {
             break;
           }
           case "archer": {
-            // Bow orbits at distance, aimed at enemy
-            const bowR = 1.2;
+            // Bow sits at the archer side; the nocked arrow shares the same horizontal line.
+            const bowR = 0.95;
             vis.weaponGroup.visible = true;
             vis.weaponGroup.position.set(
               u.x + Math.cos(u.orbitAngle) * bowR,
-              u.y,
+              u.y + 0.05,
               u.z + Math.sin(u.orbitAngle) * bowR
             );
             vis.weaponGroup.rotation.y = -u.orbitAngle + Math.PI / 2;
@@ -1890,7 +2183,7 @@ export default function ArenaSim() {
       renderer.dispose();
       if (el.contains(renderer.domElement)) el.removeChild(renderer.domElement);
     };
-  }, []);
+  }, [environment, roomShape, teamNames]);
 
   // ═══════════════════════════════════════════════════════════════════
   //  UI
@@ -1929,6 +2222,9 @@ export default function ArenaSim() {
     if (team === "A") setTeamA(prev => prev.map((u, i) => i === idx ? { ...u, hp: v } : u));
     if (team === "B") setTeamB(prev => prev.map((u, i) => i === idx ? { ...u, hp: v } : u));
   };
+  const changeTeamName = (team: TeamId, value: string) => {
+    setTeamNames(prev => ({ ...prev, [team]: value.slice(0, 24) }));
+  };
 
   const panelStyle: React.CSSProperties = {
     position:"absolute", padding:"14px 16px",
@@ -1947,7 +2243,7 @@ export default function ArenaSim() {
           {winner ? (
             <div style={{ display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", flex:1 }}>
               <div style={{ fontSize:11, color:"#334455", letterSpacing:"0.3em", marginBottom:18 }}>◈ BATTLE RESOLVED</div>
-              <div style={{ fontSize:46, fontWeight:"bold", letterSpacing:"0.15em", color:winner.includes("A") ? "#4488ff" : winner.includes("B") ? "#ff3344" : "#ffcc00", textShadow:"0 0 50px currentColor", marginBottom:30 }}>
+              <div style={{ fontSize:46, fontWeight:"bold", letterSpacing:"0.15em", color:winner.startsWith("Like") ? "#4488ff" : winner.startsWith("Subscribe") ? "#ff3344" : "#ffcc00", textShadow:"0 0 50px currentColor", marginBottom:30 }}>
                 {winner}
               </div>
               <button onClick={() => { setSimStarted(false); setConfigPhase(true); setWinner(null); winnerRef.current = null; }}
@@ -1959,13 +2255,47 @@ export default function ArenaSim() {
           ) : configPhase ? (
             <>
               <div style={{ fontSize:10, color:"#4488ff", letterSpacing:"0.35em", marginBottom:6, opacity:0.6 }}>◈ ARENA BATTLE SIM v4.0</div>
-              <div style={{ fontSize:20, color:"#fff", letterSpacing:"0.18em", marginBottom:28, textShadow:"0 0 28px #4488ff88" }}>ASSEMBLE YOUR ARMIES</div>
+              <div style={{ fontSize:20, color:"#fff", letterSpacing:"0.18em", marginBottom:12, textShadow:"0 0 28px #4488ff88" }}>ASSEMBLE YOUR ARMIES</div>
+              <div style={{ display:"flex", gap:14, flexWrap:"wrap", justifyContent:"center", marginBottom:18, maxWidth:780 }}>
+                {(["A","B"] as TeamId[]).map(team => (
+                  <label key={team} style={{ display:"flex", flexDirection:"column", gap:5, color:TEAM_CSS[team], fontSize:9, letterSpacing:"0.14em" }}>
+                    TEAM {team} NAME
+                    <input value={teamNames[team]} onChange={e => changeTeamName(team, e.target.value)}
+                      style={{ width:220, background:"#07111f", border:`1px solid ${TEAM_CSS[team]}66`, color:"#ffffff", borderRadius:5, padding:"7px 9px", ...mono }}/>
+                  </label>
+                ))}
+              </div>
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(190px, 1fr))", gap:10, width:"min(860px, calc(100vw - 40px))", marginBottom:20 }}>
+                <label style={{ color:"#88bbff", fontSize:9, letterSpacing:"0.14em" }}>
+                  ENVIRONMENT
+                  <select value={environment} onChange={e => setEnvironment(e.target.value as EnvironmentType)}
+                    style={{ display:"block", width:"100%", marginTop:6, background:"#07111f", border:"1px solid #4488ff66", color:"#ffffff", borderRadius:5, padding:"8px", ...mono }}>
+                    {(Object.keys(ENVIRONMENT_DEFS) as EnvironmentType[]).map(key => (
+                      <option key={key} value={key}>{ENVIRONMENT_DEFS[key].label}</option>
+                    ))}
+                  </select>
+                  <span style={{ display:"block", color:"#3d5872", fontSize:8, marginTop:4, letterSpacing:"0.05em" }}>{ENVIRONMENT_DEFS[environment].description}</span>
+                </label>
+                <label style={{ color:"#88bbff", fontSize:9, letterSpacing:"0.14em" }}>
+                  ROOM SHAPE
+                  <select value={roomShape} onChange={e => setRoomShape(e.target.value as RoomShape)}
+                    style={{ display:"block", width:"100%", marginTop:6, background:"#07111f", border:"1px solid #4488ff66", color:"#ffffff", borderRadius:5, padding:"8px", ...mono }}>
+                    {(Object.keys(ROOM_SHAPE_DEFS) as RoomShape[]).map(key => (
+                      <option key={key} value={key}>{ROOM_SHAPE_DEFS[key]}</option>
+                    ))}
+                  </select>
+                </label>
+                <div style={{ color:"#dbeeff", fontSize:11, lineHeight:1.65, background:"rgba(68,136,255,0.08)", border:"1px solid #4488ff33", borderRadius:7, padding:"10px 12px" }}>
+                  <div>Like on <b style={{ color:"#4488ff" }}>{teamNames.A}</b> Win</div>
+                  <div>Subscribe on <b style={{ color:"#ff3344" }}>{teamNames.B}</b> Win</div>
+                </div>
+              </div>
 
               <div style={{ display:"flex", gap:32, marginBottom:28, alignItems:"flex-start", flexWrap:"wrap", justifyContent:"center" }}>
                 {(["A","B"] as TeamId[]).map(team => (
                   <div key={team} style={{ minWidth:280 }}>
                     <div style={{ color:TEAM_CSS[team], fontSize:11, letterSpacing:"0.25em", marginBottom:12, textAlign:"center", textTransform:"uppercase" }}>
-                      ◈ TEAM {team}
+                      ◈ {teamNames[team]}
                     </div>
                     <div style={{ marginBottom:10 }}>
                       {(team === "A" ? teamA : teamB).map((cfg, idx) => (
@@ -1999,7 +2329,7 @@ export default function ArenaSim() {
                 ▶ START BATTLE
               </button>
               <div style={{ color:"#1a2a3a", fontSize:8, letterSpacing:"0.12em" }}>
-                UNIT TYPES: {ALL_TYPES.length} · MAX 6 PER TEAM · HP CONFIGURABLE · TURRETS DESTRUCTIBLE
+                UNIT TYPES: {ALL_TYPES.length} · ENV: {ENVIRONMENT_DEFS[environment].label} · ROOM: {ROOM_SHAPE_DEFS[roomShape]} · CONSTANT SPEED
               </div>
             </>
 
@@ -2009,12 +2339,14 @@ export default function ArenaSim() {
               <div style={{ display:"flex", gap:60, marginBottom:32, fontSize:11, letterSpacing:"0.15em" }}>
                 <div style={{ color:"#4488ff", textAlign:"center" }}>
                   <div style={{ fontSize:22, marginBottom:8 }}>{teamA.map(u => TYPE_ICONS[u.type]).join(" ")}</div>
-                  <div>TEAM A · {teamA.length} UNITS</div>
+                  <div>{teamNames.A} · {teamA.length} UNITS</div>
+                  <div style={{ marginTop:6, color:"#88bbff" }}>Like on {teamNames.A} Win</div>
                 </div>
                 <div style={{ color:"#334455", alignSelf:"center", fontSize:13 }}>VS</div>
                 <div style={{ color:"#ff3344", textAlign:"center" }}>
                   <div style={{ fontSize:22, marginBottom:8 }}>{teamB.map(u => TYPE_ICONS[u.type]).join(" ")}</div>
-                  <div>TEAM B · {teamB.length} UNITS</div>
+                  <div>{teamNames.B} · {teamB.length} UNITS</div>
+                  <div style={{ marginTop:6, color:"#ff8899" }}>Subscribe on {teamNames.B} Win</div>
                 </div>
               </div>
               <div style={{ fontSize:108, fontWeight:"bold", color:"#fff", lineHeight:1, textShadow:"0 0 80px #4488ff", ...mono }}>
@@ -2029,12 +2361,12 @@ export default function ArenaSim() {
       {simStarted && !winner && (
         <div style={{ ...panelStyle, top:20, left:20, maxHeight:"calc(100vh - 60px)", overflowY:"auto", minWidth:200 }}>
           <div style={{ color:"#4488ff", fontSize:9, letterSpacing:"0.2em", ...mono, marginBottom:10, textTransform:"uppercase", opacity:0.65 }}>◈ ARENA SIM v4.0</div>
-          <div style={{ color:"#4488ff", fontSize:8, letterSpacing:"0.15em", ...mono, marginBottom:6, opacity:0.45 }}>── TEAM A · AVG {Math.round(hp.A)} ──</div>
+          <div style={{ color:"#4488ff", fontSize:8, letterSpacing:"0.15em", ...mono, marginBottom:6, opacity:0.45 }}>── {teamNames.A} · AVG {Math.round(hp.A)} ──</div>
           {unitHps.filter(u => u.team === "A").map((u, i) => (
             <HpBar key={`a${i}`} label={`${TYPE_ICONS[u.type]} ${u.type}`} value={u.hp} maxValue={u.maxHp} color="#4488ff" dots={u.dots}/>
           ))}
           <div style={{ borderTop:"1px solid #0d1a2a", margin:"8px 0" }}/>
-          <div style={{ color:"#ff3344", fontSize:8, letterSpacing:"0.15em", ...mono, marginBottom:6, opacity:0.45 }}>── TEAM B · AVG {Math.round(hp.B)} ──</div>
+          <div style={{ color:"#ff3344", fontSize:8, letterSpacing:"0.15em", ...mono, marginBottom:6, opacity:0.45 }}>── {teamNames.B} · AVG {Math.round(hp.B)} ──</div>
           {unitHps.filter(u => u.team === "B").map((u, i) => (
             <HpBar key={`b${i}`} label={`${TYPE_ICONS[u.type]} ${u.type}`} value={u.hp} maxValue={u.maxHp} color="#ff3344" dots={u.dots}/>
           ))}
