@@ -26,9 +26,10 @@ type TeamId   = "A" | "B";
 type UnitType =
   | "swordsman" | "archer"   | "laser"  | "engineer"
   | "barbarian" | "king"     | "recruit"| "bomber"
-  | "toxic"     | "machinegunner" | "lina" | "huskar";
+  | "toxic"     | "machinegunner" | "lina" | "huskar"
+  | "crystal_maden" | "pudge";
 
-type ProjectileKind = "arrow" | "bullet" | "turret" | "fireball" | "spear" | "firewave";
+type ProjectileKind = "arrow" | "bullet" | "turret" | "fireball" | "spear" | "firewave" | "icebolt" | "hook";
 type DamageKind = "projectile" | "melee" | "laser" | "explosion" | "dot";
 type SoundKind = DamageKind | "impact";
 type EnvironmentType = "forest" | "winter_forest" | "rocky" | "castle";
@@ -60,6 +61,8 @@ interface ToxicDef      { hp:number; radius:number; color:number; knifeR:number;
 interface MachinegunnerDef { hp:number; radius:number; color:number; burstInterval:number; burstCount:number; bulletSpeed:number; bulletDmg:number; bulletSpread:number; }
 interface LinaDef { hp:number; radius:number; color:number; fireRate:number; projSpeed:number; projDmg:number; waveInterval:number; waveSpeed:number; waveDmg:number; }
 interface HuskarDef { hp:number; radius:number; color:number; baseFireRate:number; lowHpBonusRate:number; spearSpeed:number; spearDmg:number; selfDmg:number; }
+interface CrystalMadenDef { hp:number; radius:number; color:number; fireRate:number; projSpeed:number; projDmg:number; freezeInterval:number; freezeDuration:number; freezeTotalDmg:number; }
+interface PudgeDef { hp:number; radius:number; color:number; hookInterval:number; hookSpeed:number; hookDmg:number; }
 
 interface UnitDefs {
   swordsman:    SwordsmanDef;
@@ -74,6 +77,8 @@ interface UnitDefs {
   machinegunner:MachinegunnerDef;
   lina:         LinaDef;
   huskar:       HuskarDef;
+  crystal_maden: CrystalMadenDef;
+  pudge:        PudgeDef;
 }
 
 interface DotEffect {
@@ -126,6 +131,8 @@ interface Unit {
   targetX?: number;
   targetY?: number;
   targetZ?: number;
+  frozenTimer: number;
+  freezeTimer: number;
 }
 
 interface Projectile {
@@ -204,6 +211,8 @@ const UNIT_DEFS: UnitDefs = {
   machinegunner:{ hp:140, radius:BALL_RADIUS,        color:0xcc88ff, burstInterval:3, burstCount:4, bulletSpeed:12, bulletDmg:8, bulletSpread:0.22 },
   lina:         { hp:115, radius:BALL_RADIUS,        color:0xff5533, fireRate:1.15, projSpeed:10, projDmg:12, waveInterval:5, waveSpeed:7, waveDmg:18 },
   huskar:       { hp:170, radius:BALL_RADIUS*1.05,  color:0xcc3311, baseFireRate:0.65, lowHpBonusRate:3.2, spearSpeed:11, spearDmg:11, selfDmg:2 },
+  crystal_maden:{ hp:105, radius:BALL_RADIUS*0.95,  color:0x8eeaff, fireRate:1.2, projSpeed:9.2, projDmg:10, freezeInterval:5, freezeDuration:2, freezeTotalDmg:5 },
+  pudge:        { hp:230, radius:BALL_RADIUS*1.22,  color:0x8f5a3a, hookInterval:5, hookSpeed:7.4, hookDmg:16 },
 };
 
 
@@ -226,15 +235,18 @@ const TEAM_HEX: Record<TeamId, number>  = { A:0x4488ff,  B:0xff3344  };
 const ALL_TYPES: UnitType[] = [
   "swordsman","archer","laser","engineer","barbarian",
   "king","recruit","bomber","toxic","machinegunner","lina","huskar",
+  "crystal_maden","pudge",
 ];
 
 const TYPE_ICONS: Record<UnitType, string> = {
   swordsman:"⚔️", archer:"🏹", laser:"🔫", engineer:"🔧", barbarian:"🪓",
   king:"👑", recruit:"🪖", bomber:"💣", toxic:"☠️", machinegunner:"🔫", lina:"🔥", huskar:"🩸",
+  crystal_maden:"❄️", pudge:"🪝",
 };
 const TYPE_COLORS_CSS: Record<UnitType, string> = {
   swordsman:"#44ddff", archer:"#88ff44", laser:"#ff44ff", engineer:"#ffaa22", barbarian:"#ff4422",
   king:"#ffcc00", recruit:"#aaddff", bomber:"#ff8800", toxic:"#44ff88", machinegunner:"#cc88ff", lina:"#ff5533", huskar:"#cc3311",
+  crystal_maden:"#8eeaff", pudge:"#8f5a3a",
 };
 
 const MAX_UNITS   = 32;
@@ -363,8 +375,12 @@ function initUnit(
     shield: null,
     poisonCharges: 0,
     alive: true,
+    frozenTimer: 0,
+    freezeTimer: 0,
   };
   if (type === "lina") unit.burstTimer = UNIT_DEFS.lina.waveInterval;
+  if (type === "crystal_maden") unit.freezeTimer = UNIT_DEFS.crystal_maden.freezeInterval;
+  if (type === "pudge") unit.fireTimer = UNIT_DEFS.pudge.hookInterval;
   normalizeUnitSpeed(unit);
   return unit;
 }
@@ -453,9 +469,11 @@ function stepPhysics(balls: Unit[], dt: number, roomShape: RoomShape, decor: Dec
   const next: Unit[] = balls.map(b => ({ ...b, dots: [...b.dots], shield: b.shield ? { ...b.shield } : null }));
 
   for (const b of next) {
+    if (b.frozenTimer > 0) continue;
     b.x += b.vx * dt; b.y += b.vy * dt; b.z += b.vz * dt;
   }
   for (const b of next) {
+    if (b.frozenTimer > 0) continue;
     resolveRoomCollision(b, roomShape, onImpact);
     for (const obstacle of decor) resolveDecorCollision(b, obstacle, onImpact);
     normalizeUnitSpeed(b);
@@ -485,7 +503,9 @@ function stepPhysics(balls: Unit[], dt: number, roomShape: RoomShape, decor: Dec
       }
     }
   }
-  for (const b of next) normalizeUnitSpeed(b);
+  for (const b of next) {
+    if (b.frozenTimer <= 0) normalizeUnitSpeed(b);
+  }
   return next;
 }
 
@@ -1186,6 +1206,135 @@ function buildHuskarHelmMesh(): THREE.Group {
   return g;
 }
 
+
+function buildCrystalMadenRobeMesh(): THREE.Group {
+  const g = new THREE.Group();
+  const mantle = new THREE.Mesh(
+    new THREE.ConeGeometry(BALL_RADIUS * 1.02, BALL_RADIUS * 1.62, 18),
+    new THREE.MeshStandardMaterial({ color:0x2f8fd0, emissive:0x74ddff, emissiveIntensity:0.28, roughness:0.48, metalness:0.08 })
+  );
+  mantle.position.y = -BALL_RADIUS * 0.34;
+  const fur = new THREE.Mesh(
+    new THREE.TorusGeometry(BALL_RADIUS * 0.78, 0.09, 8, 22),
+    new THREE.MeshStandardMaterial({ color:0xf6fdff, emissive:0x9eeeff, emissiveIntensity:0.22, roughness:0.72 })
+  );
+  fur.position.y = BALL_RADIUS * 0.2;
+  fur.rotation.x = Math.PI / 2;
+  for (const sx of [-1, 1]) {
+    const sleeve = new THREE.Mesh(
+      new THREE.ConeGeometry(0.11, 0.58, 9),
+      new THREE.MeshStandardMaterial({ color:0x66cfff, emissive:0x88eeff, emissiveIntensity:0.2, roughness:0.55 })
+    );
+    sleeve.position.set(sx * BALL_RADIUS * 0.72, -BALL_RADIUS * 0.08, BALL_RADIUS * 0.18);
+    sleeve.rotation.z = sx * 0.42;
+    g.add(sleeve);
+  }
+  g.add(mantle); g.add(fur);
+  return g;
+}
+
+function buildCrystalMadenHoodMesh(): THREE.Group {
+  const g = new THREE.Group();
+  const hood = new THREE.Mesh(
+    new THREE.SphereGeometry(BALL_RADIUS * 1.04, 16, 10, 0, Math.PI * 2, 0, Math.PI * 0.62),
+    new THREE.MeshStandardMaterial({ color:0xdff9ff, emissive:0x88eaff, emissiveIntensity:0.32, roughness:0.62 })
+  );
+  const circlet = new THREE.Mesh(
+    new THREE.TorusGeometry(BALL_RADIUS * 0.7, 0.035, 8, 24),
+    new THREE.MeshStandardMaterial({ color:0x74cfff, emissive:0xffffff, emissiveIntensity:0.65, metalness:0.45, roughness:0.2 })
+  );
+  circlet.position.set(0, BALL_RADIUS * 0.18, BALL_RADIUS * 0.1);
+  circlet.rotation.x = Math.PI / 2;
+  const crystal = new THREE.Mesh(
+    new THREE.OctahedronGeometry(0.15, 0),
+    new THREE.MeshStandardMaterial({ color:0xbfffff, emissive:0x88ffff, emissiveIntensity:0.85, transparent:true, opacity:0.9 })
+  );
+  crystal.position.set(0, BALL_RADIUS * 0.36, BALL_RADIUS * 0.66);
+  g.add(hood); g.add(circlet); g.add(crystal);
+  return g;
+}
+
+function buildIceStaffMesh(): THREE.Group {
+  const g = new THREE.Group();
+  const shaft = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.035, 0.04, 1.15, 8),
+    new THREE.MeshStandardMaterial({ color:0xeefcff, emissive:0x88ccff, emissiveIntensity:0.26, metalness:0.35, roughness:0.24 })
+  );
+  shaft.rotation.z = 0.16;
+  const gem = new THREE.Mesh(
+    new THREE.OctahedronGeometry(0.18, 0),
+    new THREE.MeshStandardMaterial({ color:0x9effff, emissive:0x66f6ff, emissiveIntensity:1.0, transparent:true, opacity:0.92 })
+  );
+  gem.position.y = 0.62;
+  for (let i = 0; i < 4; i++) {
+    const shard = new THREE.Mesh(
+      new THREE.ConeGeometry(0.035, 0.24, 5),
+      new THREE.MeshBasicMaterial({ color:0xcfffff, transparent:true, opacity:0.82 })
+    );
+    const a = i * Math.PI / 2;
+    shard.position.set(Math.cos(a) * 0.16, 0.52, Math.sin(a) * 0.16);
+    shard.rotation.z = Math.cos(a) * 0.75;
+    g.add(shard);
+  }
+  g.add(shaft); g.add(gem);
+  return g;
+}
+
+function buildPudgeButcherMesh(): THREE.Group {
+  const g = new THREE.Group();
+  const apron = new THREE.Mesh(
+    new THREE.CylinderGeometry(BALL_RADIUS * 0.98, BALL_RADIUS * 1.22, BALL_RADIUS * 1.05, 14),
+    new THREE.MeshStandardMaterial({ color:0x5b382d, emissive:0x2b1008, emissiveIntensity:0.18, roughness:0.88 })
+  );
+  apron.position.y = -BALL_RADIUS * 0.22;
+  const belly = new THREE.Mesh(
+    new THREE.SphereGeometry(BALL_RADIUS * 0.68, 14, 10),
+    new THREE.MeshStandardMaterial({ color:0xb47a56, emissive:0x3a160c, emissiveIntensity:0.12, roughness:0.82 })
+  );
+  belly.position.set(0, -BALL_RADIUS * 0.18, BALL_RADIUS * 0.55);
+  belly.scale.set(1.15, 0.82, 0.58);
+  for (let i = 0; i < 4; i++) {
+    const stitch = new THREE.Mesh(
+      new THREE.BoxGeometry(0.22, 0.025, 0.018),
+      new THREE.MeshBasicMaterial({ color:0x331100 })
+    );
+    stitch.position.set((i - 1.5) * 0.12, -BALL_RADIUS * 0.1 + i * 0.04, BALL_RADIUS * 0.91);
+    stitch.rotation.z = (i % 2 ? 0.45 : -0.45);
+    g.add(stitch);
+  }
+  const belt = new THREE.Mesh(
+    new THREE.TorusGeometry(BALL_RADIUS * 0.9, 0.055, 8, 20),
+    new THREE.MeshStandardMaterial({ color:0x2b1a12, metalness:0.2, roughness:0.7 })
+  );
+  belt.rotation.x = Math.PI / 2;
+  belt.position.y = -BALL_RADIUS * 0.08;
+  g.add(apron); g.add(belly); g.add(belt);
+  return g;
+}
+
+function buildHookMesh(): THREE.Group {
+  const g = new THREE.Group();
+  const chain = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.025, 0.025, 0.78, 8),
+    new THREE.MeshStandardMaterial({ color:0x777777, metalness:0.88, roughness:0.22 })
+  );
+  chain.rotation.x = Math.PI / 2;
+  const hookCurve = new THREE.Mesh(
+    new THREE.TorusGeometry(0.17, 0.035, 8, 22, Math.PI * 1.35),
+    new THREE.MeshStandardMaterial({ color:0x9a9a9a, emissive:0x331111, emissiveIntensity:0.12, metalness:0.95, roughness:0.16 })
+  );
+  hookCurve.position.z = 0.42;
+  hookCurve.rotation.y = Math.PI / 2;
+  const point = new THREE.Mesh(
+    new THREE.ConeGeometry(0.065, 0.22, 8),
+    new THREE.MeshStandardMaterial({ color:0xb8b8b8, metalness:0.95, roughness:0.12 })
+  );
+  point.position.set(0.16, 0, 0.5);
+  point.rotation.z = -Math.PI / 2;
+  g.add(chain); g.add(hookCurve); g.add(point);
+  return g;
+}
+
 // Turret with HP
 function buildTurretMesh(teamColor: number): THREE.Group {
   const g = new THREE.Group();
@@ -1513,6 +1662,24 @@ export default function ArenaSim() {
       shield.visible = false; scene.add(shield); shieldMeshes.push(shield);
     }
 
+    const freezeMeshes: THREE.Group[] = [];
+    for (let i = 0; i < MAX_UNITS; i++) {
+      const ice = new THREE.Group();
+      ice.visible = false;
+      for (let j = 0; j < 8; j++) {
+        const shard = new THREE.Mesh(
+          new THREE.ConeGeometry(0.1 + (j % 3) * 0.035, 0.78 + (j % 2) * 0.3, 5),
+          new THREE.MeshBasicMaterial({ color:j % 2 ? 0xcfffff : 0x8feeff, transparent:true, opacity:0.72 })
+        );
+        const a = (j / 8) * Math.PI * 2;
+        shard.position.set(Math.cos(a) * 0.48, -0.1, Math.sin(a) * 0.48);
+        shard.rotation.z = Math.cos(a) * 0.45;
+        shard.rotation.x = Math.sin(a) * 0.45;
+        ice.add(shard);
+      }
+      scene.add(ice); freezeMeshes.push(ice);
+    }
+
     // Store built meshes per unit to avoid rebuilding every frame
     const builtOutfits: Map<number, { type: UnitType; cracked: boolean; tartanRatio: number }> = new Map();
 
@@ -1618,6 +1785,22 @@ export default function ArenaSim() {
           vis.helmetGroup.add(helm);
           break;
         }
+        case "crystal_maden": {
+          const robe = buildCrystalMadenRobeMesh();
+          const hood = buildCrystalMadenHoodMesh();
+          const staff = buildIceStaffMesh(); staff.scale.setScalar(1.15);
+          vis.outfitGroup.add(robe);
+          vis.helmetGroup.add(hood);
+          vis.weaponGroup.add(staff);
+          break;
+        }
+        case "pudge": {
+          const butcher = buildPudgeButcherMesh();
+          const hook = buildHookMesh(); hook.scale.setScalar(1.3);
+          vis.outfitGroup.add(butcher);
+          vis.weaponGroup.add(hook);
+          break;
+        }
       }
 
       builtOutfits.set(idx, { type: u.type, cracked: hpRatio <= 0.5, tartanRatio: cacheKey.tartanRatio });
@@ -1660,12 +1843,31 @@ export default function ArenaSim() {
       );
       fireball.name = "fireball";
       const spear = buildBurningSpearMesh(); spear.name = "spear"; spear.scale.setScalar(0.65);
-      const wave = new THREE.Mesh(
-        new THREE.RingGeometry(0.18, 0.35, 24),
-        new THREE.MeshBasicMaterial({ color:0xff7722, transparent:true, opacity:0.72, side:THREE.DoubleSide })
+      const icebolt = new THREE.Mesh(
+        new THREE.OctahedronGeometry(0.18, 0),
+        new THREE.MeshBasicMaterial({ color:0xbfffff, transparent:true, opacity:0.9 })
       );
+      icebolt.name = "icebolt";
+      const hookProj = buildHookMesh(); hookProj.name = "hook"; hookProj.scale.setScalar(0.9);
+      const wave = new THREE.Group();
       wave.name = "firewave";
-      g.add(arrow); g.add(bullet); g.add(fireball); g.add(spear); g.add(wave);
+      const waveCore = new THREE.Mesh(
+        new THREE.BoxGeometry(1.45, 0.14, 0.22),
+        new THREE.MeshBasicMaterial({ color:0xffaa22, transparent:true, opacity:0.48, side:THREE.DoubleSide })
+      );
+      waveCore.name = "firewaveCore";
+      wave.add(waveCore);
+      for (let wi = 0; wi < 9; wi++) {
+        const flame = new THREE.Mesh(
+          new THREE.ConeGeometry(0.13 + (wi % 3) * 0.025, 0.6 + (wi % 2) * 0.22, 8),
+          new THREE.MeshBasicMaterial({ color:wi % 2 ? 0xffdd44 : 0xff4a11, transparent:true, opacity:0.82 })
+        );
+        flame.position.set((wi - 4) * 0.17, 0.08 + Math.sin(wi) * 0.03, 0);
+        flame.rotation.x = Math.PI / 2;
+        flame.rotation.z = (wi - 4) * 0.08;
+        wave.add(flame);
+      }
+      g.add(arrow); g.add(bullet); g.add(fireball); g.add(spear); g.add(icebolt); g.add(hookProj); g.add(wave);
       g.visible = false; scene.add(g); projMeshes.push(g);
     }
 
@@ -1827,6 +2029,7 @@ export default function ArenaSim() {
       else flashMat.opacity = 0;
 
       for (const u of next) {
+        if (u.frozenTimer > 0) u.frozenTimer = Math.max(0, u.frozenTimer - dt);
         tickDots(u, dt, playDamageSound);
         if (u.shield) {
           u.shield.remaining -= dt;
@@ -2123,12 +2326,57 @@ export default function ArenaSim() {
           }
           if (u.burstTimer <= 0) {
             u.burstTimer = def.waveInterval;
-            const a = rnd(0, Math.PI * 2);
+            const a = nearestEnemy ? Math.atan2(nearestEnemy.z - u.z, nearestEnemy.x - u.x) : rnd(0, Math.PI * 2);
             newProj.push({ x:u.x, y:u.y, z:u.z,
-              vx:Math.cos(a) * def.waveSpeed, vy:rnd(-0.12, 0.12) * def.waveSpeed, vz:Math.sin(a) * def.waveSpeed,
-              gravity:undefined, dmg:def.waveDmg, team:u.team, life:1.9, color:0xff7722, dot:null, kind:"firewave", radius:0.42 });
+              vx:Math.cos(a) * def.waveSpeed, vy:0, vz:Math.sin(a) * def.waveSpeed,
+              gravity:undefined, dmg:def.waveDmg, team:u.team, life:2.15, color:0xff7722, dot:null, kind:"firewave", radius:0.95 });
           }
         }
+
+        if (u.type === "crystal_maden") {
+          const def = UNIT_DEFS.crystal_maden;
+          u.fireTimer -= dt;
+          u.freezeTimer -= dt;
+          if (nearestEnemy) {
+            const dx = nearestEnemy.x - u.x, dz = nearestEnemy.z - u.z;
+            u.orbitAngle = Math.atan2(dz, dx);
+          } else {
+            u.orbitAngle += dt * 1.6;
+          }
+          if (u.fireTimer <= 0 && nearestEnemy) {
+            u.fireTimer = 1 / def.fireRate;
+            const dx = nearestEnemy.x - u.x, dy = nearestEnemy.y - u.y, dz = nearestEnemy.z - u.z;
+            const d = Math.max(Math.sqrt(dx*dx + dy*dy + dz*dz), 0.01);
+            const poisonDot = u.poisonCharges > 0 ? { duration: BONUS_POISON_DURATION, dmg: BONUS_POISON_DMG } : null;
+            if (poisonDot) u.poisonCharges--;
+            newProj.push({ x:u.x, y:u.y + 0.12, z:u.z,
+              vx:(dx/d) * def.projSpeed, vy:(dy/d) * def.projSpeed, vz:(dz/d) * def.projSpeed,
+              gravity:undefined, dmg:def.projDmg, team:u.team, life:2.7, color:0x9effff, dot:poisonDot, kind:"icebolt", radius:0.2 });
+          }
+          if (u.freezeTimer <= 0 && nearestEnemy) {
+            u.freezeTimer = def.freezeInterval;
+            nearestEnemy.frozenTimer = Math.max(nearestEnemy.frozenTimer, def.freezeDuration);
+            nearestEnemy.dots.push({ remaining:def.freezeDuration, dmg:def.freezeTotalDmg / def.freezeDuration, tickTimer:0 });
+            playDamageSound("dot");
+          }
+        }
+
+        if (u.type === "pudge") {
+          const def = UNIT_DEFS.pudge;
+          u.orbitAngle += dt * 3.2;
+          u.fireTimer -= dt;
+          if (nearestEnemy && u.fireTimer <= 0) {
+            u.fireTimer = def.hookInterval;
+            const dx = nearestEnemy.x - u.x, dy = nearestEnemy.y - u.y, dz = nearestEnemy.z - u.z;
+            const d = Math.max(Math.sqrt(dx*dx + dy*dy + dz*dz), 0.01);
+            const poisonDot = u.poisonCharges > 0 ? { duration: BONUS_POISON_DURATION, dmg: BONUS_POISON_DMG } : null;
+            if (poisonDot) u.poisonCharges--;
+            newProj.push({ x:u.x, y:u.y + 0.04, z:u.z,
+              vx:(dx/d) * def.hookSpeed, vy:(dy/d) * def.hookSpeed, vz:(dz/d) * def.hookSpeed,
+              gravity:undefined, dmg:def.hookDmg, team:u.team, life:3.0, color:0xaaaaaa, dot:poisonDot, kind:"hook", radius:0.24 });
+          }
+        }
+
 
         if (u.type === "huskar") {
           const def = UNIT_DEFS.huskar;
@@ -2228,11 +2476,13 @@ export default function ArenaSim() {
           vis.helmetGroup.visible = false;
           laserMeshes[i].visible = false;
           shieldMeshes[i].visible = false;
+          freezeMeshes[i].visible = false;
           continue;
         }
 
         mesh.visible = true;
         mesh.position.set(u.x, u.y, u.z);
+        mesh.scale.setScalar((u.radius || BALL_RADIUS) / BALL_RADIUS);
         ballMats[i].color.setHex(u.color);
         ballMats[i].emissive.setHex(u.color);
         ballMats[i].emissiveIntensity = 0.3 + 0.7 * (1 - u.hp / u.maxHp);
@@ -2249,6 +2499,21 @@ export default function ArenaSim() {
         rebuildUnitVisuals(i, u);
 
         const hpRatio = u.hp / u.maxHp;
+
+        if (u.frozenTimer > 0) {
+          const fm = freezeMeshes[i];
+          fm.visible = true;
+          fm.position.set(u.x, u.y, u.z);
+          fm.rotation.y = globalTime * 0.9;
+          const pulse = 1 + 0.1 * Math.sin(globalTime * 12);
+          fm.scale.setScalar(pulse * (1 + (1 - u.frozenTimer / 2) * 0.18));
+          fm.children.forEach((child, ci) => {
+            const mat2 = (child as THREE.Mesh).material as THREE.MeshBasicMaterial;
+            mat2.opacity = 0.56 + 0.28 * Math.sin(globalTime * 8 + ci);
+          });
+        } else {
+          freezeMeshes[i].visible = false;
+        }
 
         const sm = shieldMeshes[i];
         if (u.shield) {
@@ -2446,6 +2711,34 @@ export default function ArenaSim() {
             vis.helmetGroup.position.set(u.x, u.y + BALL_RADIUS * 0.55, u.z);
             break;
           }
+          case "crystal_maden": {
+            const staffR = 0.88;
+            vis.weaponGroup.visible = true;
+            vis.weaponGroup.position.set(
+              u.x + Math.cos(u.orbitAngle) * staffR,
+              u.y + 0.08,
+              u.z + Math.sin(u.orbitAngle) * staffR
+            );
+            vis.weaponGroup.rotation.y = -u.orbitAngle + Math.PI / 2;
+            vis.weaponGroup.rotation.z = Math.sin(globalTime * 4) * 0.12;
+            vis.helmetGroup.visible = true;
+            vis.helmetGroup.position.set(u.x, u.y + BALL_RADIUS * 0.55, u.z);
+            vis.helmetGroup.rotation.y = Math.sin(globalTime * 1.8) * 0.16;
+            break;
+          }
+          case "pudge": {
+            const hookR = 1.05;
+            vis.weaponGroup.visible = true;
+            vis.weaponGroup.position.set(
+              u.x + Math.cos(u.orbitAngle) * hookR,
+              u.y + 0.02,
+              u.z + Math.sin(u.orbitAngle) * hookR
+            );
+            vis.weaponGroup.rotation.y = -u.orbitAngle + Math.PI / 2;
+            vis.weaponGroup.rotation.z = globalTime * 2.8;
+            vis.helmetGroup.visible = false;
+            break;
+          }
           default:
             vis.weaponGroup.visible = false;
             vis.helmetGroup.visible = false;
@@ -2486,7 +2779,9 @@ export default function ArenaSim() {
           const bullet = pm.getObjectByName("bullet") as THREE.Mesh | undefined;
           const fireball = pm.getObjectByName("fireball") as THREE.Mesh | undefined;
           const spear = pm.getObjectByName("spear") as THREE.Group | undefined;
-          const wave = pm.getObjectByName("firewave") as THREE.Mesh | undefined;
+          const icebolt = pm.getObjectByName("icebolt") as THREE.Mesh | undefined;
+          const hook = pm.getObjectByName("hook") as THREE.Group | undefined;
+          const wave = pm.getObjectByName("firewave") as THREE.Group | undefined;
           if (arrow) arrow.visible = p.kind === "arrow";
           if (bullet) {
             bullet.visible = p.kind === "bullet" || p.kind === "turret";
@@ -2498,10 +2793,26 @@ export default function ArenaSim() {
             fireball.scale.setScalar(1 + 0.22 * Math.sin(globalTime * 18));
           }
           if (spear) spear.visible = p.kind === "spear";
+          if (icebolt) {
+            icebolt.visible = p.kind === "icebolt";
+            icebolt.rotation.x = globalTime * 5;
+            icebolt.rotation.z = globalTime * 7;
+            icebolt.scale.setScalar(1 + 0.18 * Math.sin(globalTime * 18));
+          }
+          if (hook) {
+            hook.visible = p.kind === "hook";
+            hook.rotation.z = globalTime * 8;
+          }
           if (wave) {
             wave.visible = p.kind === "firewave";
-            wave.rotation.z = globalTime * 5;
-            wave.scale.setScalar(1 + 0.5 * (1 - p.life / 1.9));
+            wave.rotation.z = Math.sin(globalTime * 10) * 0.08;
+            const waveAge = 1 - p.life / 2.15;
+            wave.scale.set(1.2 + waveAge * 1.4, 1.2 + waveAge * 0.6, 1.2 + waveAge * 0.35);
+            wave.children.forEach((child, ci) => {
+              child.position.y = (ci === 0 ? 0 : 0.08 + Math.sin(globalTime * 13 + ci) * 0.06);
+              const mat2 = (child as THREE.Mesh).material as THREE.MeshBasicMaterial | undefined;
+              if (mat2?.opacity !== undefined) mat2.opacity = ci === 0 ? 0.38 : 0.62 + 0.22 * Math.sin(globalTime * 11 + ci);
+            });
           }
         } else pm.visible = false;
       }
