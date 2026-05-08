@@ -10,15 +10,25 @@ const BALL_RADIUS = 0.6;
 
 const INITIAL_SPEED_Y:  [number, number] = [-2, 2];
 const BALL_SPEED = 4.4;
+const BONUS_SPAWN_INTERVAL = 5;
+const BONUS_VISIBLE_TIME = 5;
+const BONUS_FADE_TIME = 3;
+const SHIELD_HP = 10;
+const SHIELD_DURATION = 5;
+const HEART_HEAL = 10;
+const BONUS_POISON_DMG = 1;
+const BONUS_POISON_DURATION = 4;
+const HUSKAR_MISSING_HP_REGEN_PER_SEC = 0.001;
+
 
 
 type TeamId   = "A" | "B";
 type UnitType =
   | "swordsman" | "archer"   | "laser"  | "engineer"
   | "barbarian" | "king"     | "recruit"| "bomber"
-  | "toxic"     | "machinegunner";
+  | "toxic"     | "machinegunner" | "lina" | "huskar";
 
-type ProjectileKind = "arrow" | "bullet" | "turret";
+type ProjectileKind = "arrow" | "bullet" | "turret" | "fireball" | "spear" | "firewave";
 type DamageKind = "projectile" | "melee" | "laser" | "explosion" | "dot";
 type SoundKind = DamageKind | "impact";
 type EnvironmentType = "forest" | "winter_forest" | "rocky" | "castle";
@@ -48,6 +58,8 @@ interface RecruitDef    { hp:number; radius:number; color:number; spearDmg:numbe
 interface BomberDef     { hp:number; radius:number; color:number; bombInterval:number; bombRadius:number;   bombDmg:number; }
 interface ToxicDef      { hp:number; radius:number; color:number; knifeR:number;     knifeDmg:number;       dotDmg:number; dotDuration:number; }
 interface MachinegunnerDef { hp:number; radius:number; color:number; burstInterval:number; burstCount:number; bulletSpeed:number; bulletDmg:number; bulletSpread:number; }
+interface LinaDef { hp:number; radius:number; color:number; fireRate:number; projSpeed:number; projDmg:number; waveInterval:number; waveSpeed:number; waveDmg:number; }
+interface HuskarDef { hp:number; radius:number; color:number; baseFireRate:number; lowHpBonusRate:number; spearSpeed:number; spearDmg:number; selfDmg:number; }
 
 interface UnitDefs {
   swordsman:    SwordsmanDef;
@@ -60,12 +72,29 @@ interface UnitDefs {
   bomber:       BomberDef;
   toxic:        ToxicDef;
   machinegunner:MachinegunnerDef;
+  lina:         LinaDef;
+  huskar:       HuskarDef;
 }
 
 interface DotEffect {
   remaining: number;
   dmg:       number;
   tickTimer: number;
+}
+
+type BonusType = "shield" | "heart" | "poison";
+
+interface Bonus {
+  x: number; y: number; z: number;
+  type: BonusType;
+  age: number;
+  id: number;
+}
+
+interface ShieldState {
+  hp: number;
+  maxHp: number;
+  remaining: number;
 }
 
 interface Unit {
@@ -90,6 +119,8 @@ interface Unit {
   burstShotsLeft: number;
   burstFireTimer: number;
   dots: DotEffect[];
+  shield: ShieldState | null;
+  poisonCharges: number;
   alive: boolean;
   // target tracking
   targetX?: number;
@@ -107,6 +138,7 @@ interface Projectile {
   color: number;
   dot:   { duration: number; dmg: number } | null;
   kind:  ProjectileKind;
+  radius?: number;
 }
 
 interface Turret {
@@ -131,6 +163,8 @@ interface SimState {
   projectiles: Projectile[];
   turrets:     Turret[];
   bombs:       Bomb[];
+  bonuses:     Bonus[];
+  bonusTimer:  number;
   decor:       DecorObstacle[];
   roomShape:   RoomShape;
   yaw:         number;
@@ -153,6 +187,8 @@ interface UnitHpInfo {
   hp:     number;
   maxHp:  number;
   dots:   number;
+  shieldHp?: number;
+  poisonCharges?: number;
 }
 
 const UNIT_DEFS: UnitDefs = {
@@ -166,6 +202,8 @@ const UNIT_DEFS: UnitDefs = {
   bomber:       { hp:90,  radius:BALL_RADIUS,        color:0xff8800, bombInterval:3, bombRadius:3, bombDmg:20 },
   toxic:        { hp:110, radius:BALL_RADIUS,        color:0x44ff88, knifeR:1.1,   knifeDmg:2,  dotDmg:1, dotDuration:5 },
   machinegunner:{ hp:140, radius:BALL_RADIUS,        color:0xcc88ff, burstInterval:3, burstCount:4, bulletSpeed:12, bulletDmg:8, bulletSpread:0.22 },
+  lina:         { hp:115, radius:BALL_RADIUS,        color:0xff5533, fireRate:1.15, projSpeed:10, projDmg:12, waveInterval:5, waveSpeed:7, waveDmg:18 },
+  huskar:       { hp:170, radius:BALL_RADIUS*1.05,  color:0xcc3311, baseFireRate:0.65, lowHpBonusRate:3.2, spearSpeed:11, spearDmg:11, selfDmg:2 },
 };
 
 
@@ -187,22 +225,23 @@ const TEAM_HEX: Record<TeamId, number>  = { A:0x4488ff,  B:0xff3344  };
 
 const ALL_TYPES: UnitType[] = [
   "swordsman","archer","laser","engineer","barbarian",
-  "king","recruit","bomber","toxic","machinegunner",
+  "king","recruit","bomber","toxic","machinegunner","lina","huskar",
 ];
 
 const TYPE_ICONS: Record<UnitType, string> = {
   swordsman:"⚔️", archer:"🏹", laser:"🔫", engineer:"🔧", barbarian:"🪓",
-  king:"👑", recruit:"🪖", bomber:"💣", toxic:"☠️", machinegunner:"🔫",
+  king:"👑", recruit:"🪖", bomber:"💣", toxic:"☠️", machinegunner:"🔫", lina:"🔥", huskar:"🩸",
 };
 const TYPE_COLORS_CSS: Record<UnitType, string> = {
   swordsman:"#44ddff", archer:"#88ff44", laser:"#ff44ff", engineer:"#ffaa22", barbarian:"#ff4422",
-  king:"#ffcc00", recruit:"#aaddff", bomber:"#ff8800", toxic:"#44ff88", machinegunner:"#cc88ff",
+  king:"#ffcc00", recruit:"#aaddff", bomber:"#ff8800", toxic:"#44ff88", machinegunner:"#cc88ff", lina:"#ff5533", huskar:"#cc3311",
 };
 
 const MAX_UNITS   = 32;
 const MAX_PROJ    = 160;
 const MAX_TURRETS = 16;
 const MAX_BOMBS   = 24;
+const MAX_BONUSES = 1;
 const TRAIL_LEN   = 8;
 
 function clamp(v: number, lo: number, hi: number): number {
@@ -221,14 +260,56 @@ function dist3(
 
 function applyDamage(unit: Unit, amount: number, kind: DamageKind, onDamage?: (kind: DamageKind) => void): void {
   if (amount <= 0 || unit.hp <= 0) return;
-  // Swordsman gets 50% damage reduction while hp > 50%
   let actualAmount = amount;
   if (unit.type === "swordsman" && unit.hp / unit.maxHp > 0.5) {
     actualAmount = amount * 0.5;
   }
+  if (unit.shield && unit.shield.hp > 0 && (kind === "projectile" || kind === "melee")) {
+    const beforeShield = unit.shield.hp;
+    unit.shield.hp = clamp(unit.shield.hp - actualAmount, 0, unit.shield.maxHp);
+    if (unit.shield.hp < beforeShield) onDamage?.(kind);
+    if (unit.shield.hp <= 0) unit.shield = null;
+    return;
+  }
   const before = unit.hp;
   unit.hp = clamp(unit.hp - actualAmount, 0, unit.maxHp);
   if (unit.hp < before) onDamage?.(kind);
+}
+
+function applyDamageToTurret(turret: Turret, amount: number, onDamage?: (kind: DamageKind) => void, kind: DamageKind = "projectile"): void {
+  if (amount <= 0 || !turret.alive || turret.hp <= 0) return;
+  const before = turret.hp;
+  turret.hp = clamp(turret.hp - amount, 0, turret.maxHp);
+  if (turret.hp < before) onDamage?.(kind);
+  if (turret.hp <= 0) turret.alive = false;
+}
+
+function addBonusPoison(unit: Unit, target: Unit): void {
+  if (unit.poisonCharges <= 0 || target.hp <= 0) return;
+  target.dots.push({ remaining: BONUS_POISON_DURATION, dmg: BONUS_POISON_DMG, tickTimer: 0 });
+  unit.poisonCharges--;
+}
+
+function randomBonus(): Bonus {
+  const types: BonusType[] = ["shield", "heart", "poison"];
+  return {
+    x: rnd(-HALF + 0.55, HALF - 0.55),
+    y: rnd(-HALF + 0.55, HALF - 0.55),
+    z: rnd(-HALF + 0.55, HALF - 0.55),
+    type: types[Math.floor(Math.random() * types.length)],
+    age: 0,
+    id: Math.random(),
+  };
+}
+
+function applyBonus(unit: Unit, bonus: Bonus): void {
+  if (bonus.type === "shield") {
+    unit.shield = { hp: SHIELD_HP, maxHp: SHIELD_HP, remaining: SHIELD_DURATION };
+  } else if (bonus.type === "heart") {
+    unit.hp = clamp(unit.hp + HEART_HEAL, 0, unit.maxHp);
+  } else {
+    unit.poisonCharges++;
+  }
 }
 
 
@@ -279,8 +360,11 @@ function initUnit(
     bombTimer: 0,
     burstTimer: 0, burstShotsLeft: 0, burstFireTimer: 0,
     dots: [],
+    shield: null,
+    poisonCharges: 0,
     alive: true,
   };
+  if (type === "lina") unit.burstTimer = UNIT_DEFS.lina.waveInterval;
   normalizeUnitSpeed(unit);
   return unit;
 }
@@ -366,7 +450,7 @@ function resolveRoomCollision(unit: Unit, roomShape: RoomShape, onImpact?: () =>
 }
 
 function stepPhysics(balls: Unit[], dt: number, roomShape: RoomShape, decor: DecorObstacle[], onImpact?: () => void): Unit[] {
-  const next: Unit[] = balls.map(b => ({ ...b, dots: [...b.dots] }));
+  const next: Unit[] = balls.map(b => ({ ...b, dots: [...b.dots], shield: b.shield ? { ...b.shield } : null }));
 
   for (const b of next) {
     b.x += b.vx * dt; b.y += b.vy * dt; b.z += b.vz * dt;
@@ -425,9 +509,8 @@ function stepProjectiles(
     let hitTurret = false;
     for (const t of turrets) {
       if (!t.alive || t.team === p.team) continue;
-      if (dist3(t, p) < 0.4) {
-        t.hp -= p.dmg;
-        if (t.hp <= 0) t.alive = false;
+      if (dist3(t, p) < 0.4 + (p.radius ?? 0.12)) {
+        applyDamageToTurret(t, p.dmg, onDamage, "projectile");
         p.life = 0; hitTurret = true; break;
       }
     }
@@ -435,9 +518,10 @@ function stepProjectiles(
 
     for (const u of units) {
       if (u.team === p.team || u.hp <= 0) continue;
-      if (dist3(u, p) < (u.radius || BALL_RADIUS) + 0.15) {
+      if (dist3(u, p) < (u.radius || BALL_RADIUS) + (p.radius ?? 0.15)) {
+        const hitShield = !!u.shield;
         applyDamage(u, p.dmg, "projectile", onDamage);
-        if (p.dot) {
+        if (p.dot && !hitShield) {
           u.dots.push({ remaining: p.dot.duration, dmg: p.dot.dmg, tickTimer: 0 });
         }
         p.life = 0; break;
@@ -1032,6 +1116,76 @@ function buildWorkerVestMesh(): THREE.Group {
   return g;
 }
 
+
+function buildFireDressMesh(): THREE.Group {
+  const g = new THREE.Group();
+  const dress = new THREE.Mesh(
+    new THREE.ConeGeometry(BALL_RADIUS * 0.95, BALL_RADIUS * 1.55, 18),
+    new THREE.MeshStandardMaterial({ color:0xff3311, emissive:0xff6600, emissiveIntensity:0.45, roughness:0.55 })
+  );
+  dress.position.y = -BALL_RADIUS * 0.35;
+  for (let i = 0; i < 8; i++) {
+    const a = i * Math.PI / 4;
+    const flame = new THREE.Mesh(
+      new THREE.ConeGeometry(0.08, 0.42, 7),
+      new THREE.MeshBasicMaterial({ color:i % 2 ? 0xffdd33 : 0xff6600, transparent:true, opacity:0.88 })
+    );
+    flame.position.set(Math.cos(a) * BALL_RADIUS * 0.62, -BALL_RADIUS * 0.82, Math.sin(a) * BALL_RADIUS * 0.62);
+    flame.rotation.z = Math.sin(a) * 0.35;
+    g.add(flame);
+  }
+  g.add(dress);
+  return g;
+}
+
+function buildRedHairMesh(): THREE.Group {
+  const g = new THREE.Group();
+  const hair = new THREE.Mesh(
+    new THREE.SphereGeometry(BALL_RADIUS * 1.04, 16, 10, 0, Math.PI * 2, 0, Math.PI * 0.58),
+    new THREE.MeshStandardMaterial({ color:0xcc3300, emissive:0xff4400, emissiveIntensity:0.2, roughness:0.78 })
+  );
+  hair.position.y = BALL_RADIUS * 0.18;
+  const lock = new THREE.Mesh(
+    new THREE.ConeGeometry(0.16, 0.55, 8),
+    new THREE.MeshStandardMaterial({ color:0xdd4400, emissive:0xff6600, emissiveIntensity:0.25, roughness:0.75 })
+  );
+  lock.position.set(0.18, BALL_RADIUS * 0.05, BALL_RADIUS * 0.62);
+  lock.rotation.z = -0.45;
+  g.add(hair); g.add(lock);
+  return g;
+}
+
+function buildBurningSpearMesh(): THREE.Group {
+  const g = buildSpearMesh();
+  const flame = new THREE.Mesh(
+    new THREE.ConeGeometry(0.11, 0.32, 9),
+    new THREE.MeshBasicMaterial({ color:0xff6622, transparent:true, opacity:0.85 })
+  );
+  flame.position.y = 0.55;
+  g.add(flame);
+  return g;
+}
+
+function buildHuskarHelmMesh(): THREE.Group {
+  const g = new THREE.Group();
+  const band = new THREE.Mesh(
+    new THREE.CylinderGeometry(BALL_RADIUS * 0.82, BALL_RADIUS * 0.85, 0.12, 16),
+    new THREE.MeshStandardMaterial({ color:0x662211, emissive:0xaa2200, emissiveIntensity:0.18, roughness:0.7 })
+  );
+  band.position.y = BALL_RADIUS * 0.18;
+  for (const sx of [-1, 1]) {
+    const horn = new THREE.Mesh(
+      new THREE.ConeGeometry(0.08, 0.46, 8),
+      new THREE.MeshStandardMaterial({ color:0xf3d7aa, roughness:0.55 })
+    );
+    horn.position.set(sx * BALL_RADIUS * 0.55, BALL_RADIUS * 0.38, 0);
+    horn.rotation.z = sx * -0.9;
+    g.add(horn);
+  }
+  g.add(band);
+  return g;
+}
+
 // Turret with HP
 function buildTurretMesh(teamColor: number): THREE.Group {
   const g = new THREE.Group();
@@ -1196,7 +1350,7 @@ function createRoomMesh(roomShape: RoomShape): THREE.Object3D {
 export default function ArenaSim() {
   const mountRef = useRef<HTMLDivElement>(null);
   const stateRef = useRef<SimState>({
-    balls: [], projectiles: [], turrets: [], bombs: [],
+    balls: [], projectiles: [], turrets: [], bombs: [], bonuses: [], bonusTimer: BONUS_SPAWN_INTERVAL,
     decor: generateDecorObstacles("forest"), roomShape: "cube",
     yaw: 0, pitch: 0.3, orbitDist: 20,
     keys: {}, collisionFlash: 0, simRunning: false, lastDamageKind: null,
@@ -1252,6 +1406,8 @@ export default function ArenaSim() {
     s.projectiles = [];
     s.turrets     = [];
     s.bombs       = [];
+    s.bonuses     = [];
+    s.bonusTimer  = BONUS_SPAWN_INTERVAL;
     s.decor       = generateDecorObstacles(environment);
     s.roomShape   = roomShape;
     s.simRunning  = false;
@@ -1348,6 +1504,15 @@ export default function ArenaSim() {
       unitVisuals.push({ outfitGroup, weaponGroup, helmetGroup });
     }
 
+    const shieldMeshes: THREE.Mesh[] = [];
+    for (let i = 0; i < MAX_UNITS; i++) {
+      const shield = new THREE.Mesh(
+        new THREE.TorusGeometry(BALL_RADIUS * 1.15, 0.045, 8, 32),
+        new THREE.MeshBasicMaterial({ color:0x66ccff, transparent:true, opacity:0.62 })
+      );
+      shield.visible = false; scene.add(shield); shieldMeshes.push(shield);
+    }
+
     // Store built meshes per unit to avoid rebuilding every frame
     const builtOutfits: Map<number, { type: UnitType; cracked: boolean; tartanRatio: number }> = new Map();
 
@@ -1439,6 +1604,20 @@ export default function ArenaSim() {
           vis.outfitGroup.add(vest);
           break;
         }
+        case "lina": {
+          const dress = buildFireDressMesh();
+          const hair = buildRedHairMesh();
+          vis.outfitGroup.add(dress);
+          vis.helmetGroup.add(hair);
+          break;
+        }
+        case "huskar": {
+          const spear = buildBurningSpearMesh(); spear.scale.setScalar(1.25);
+          const helm = buildHuskarHelmMesh();
+          vis.weaponGroup.add(spear);
+          vis.helmetGroup.add(helm);
+          break;
+        }
       }
 
       builtOutfits.set(idx, { type: u.type, cracked: hpRatio <= 0.5, tartanRatio: cacheKey.tartanRatio });
@@ -1475,7 +1654,18 @@ export default function ArenaSim() {
         new THREE.MeshBasicMaterial({ color:0xffff44, transparent:true, opacity:0.9 })
       );
       bullet.name = "bullet";
-      g.add(arrow); g.add(bullet);
+      const fireball = new THREE.Mesh(
+        new THREE.SphereGeometry(0.16, 10, 10),
+        new THREE.MeshBasicMaterial({ color:0xff5522, transparent:true, opacity:0.92 })
+      );
+      fireball.name = "fireball";
+      const spear = buildBurningSpearMesh(); spear.name = "spear"; spear.scale.setScalar(0.65);
+      const wave = new THREE.Mesh(
+        new THREE.RingGeometry(0.18, 0.35, 24),
+        new THREE.MeshBasicMaterial({ color:0xff7722, transparent:true, opacity:0.72, side:THREE.DoubleSide })
+      );
+      wave.name = "firewave";
+      g.add(arrow); g.add(bullet); g.add(fireball); g.add(spear); g.add(wave);
       g.visible = false; scene.add(g); projMeshes.push(g);
     }
 
@@ -1520,6 +1710,37 @@ export default function ArenaSim() {
       m.visible = false; scene.add(m); explMeshes.push(m);
     }
     const explTimers: number[] = new Array<number>(MAX_BOMBS).fill(0);
+
+    // ── Bonus pickup pool ──────────────────────────────────────────
+    const bonusMeshes: THREE.Group[] = [];
+    for (let i = 0; i < MAX_BONUSES; i++) {
+      const g = new THREE.Group();
+      const shieldIcon = new THREE.Mesh(
+        new THREE.TorusGeometry(0.22, 0.045, 8, 24),
+        new THREE.MeshBasicMaterial({ color:0x66ccff, transparent:true, opacity:0.95 })
+      );
+      shieldIcon.name = "shield";
+      const heartShape = new THREE.Shape();
+      heartShape.moveTo(0, 0.12);
+      heartShape.bezierCurveTo(-0.28, 0.34, -0.48, 0.05, 0, -0.28);
+      heartShape.bezierCurveTo(0.48, 0.05, 0.28, 0.34, 0, 0.12);
+      const heart = new THREE.Mesh(
+        new THREE.ExtrudeGeometry(heartShape, { depth:0.07, bevelEnabled:true, bevelSize:0.015, bevelThickness:0.015 }),
+        new THREE.MeshBasicMaterial({ color:0xff3355, transparent:true, opacity:0.95 })
+      );
+      heart.name = "heart";
+      heart.scale.setScalar(0.9);
+      const bottle = new THREE.Group(); bottle.name = "poison";
+      const vial = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.09, 0.12, 0.36, 12),
+        new THREE.MeshStandardMaterial({ color:0x8a22ff, emissive:0xaa44ff, emissiveIntensity:0.7, transparent:true, opacity:0.85 })
+      );
+      const cork = new THREE.Mesh(new THREE.CylinderGeometry(0.055, 0.055, 0.1, 8), new THREE.MeshStandardMaterial({ color:0x7a4a20 }));
+      cork.position.y = 0.23;
+      bottle.add(vial); bottle.add(cork);
+      g.add(shieldIcon); g.add(heart); g.add(bottle);
+      g.visible = false; scene.add(g); bonusMeshes.push(g);
+    }
 
     // ── Collision flash plane ──────────────────────────────────────
     const flashMat   = new THREE.MeshBasicMaterial({ color:0xffffff, transparent:true, opacity:0, depthTest:false });
@@ -1605,7 +1826,40 @@ export default function ArenaSim() {
       if (s.collisionFlash > 0) { s.collisionFlash -= dt; flashMat.opacity = clamp(s.collisionFlash * 1.2, 0, 0.18); }
       else flashMat.opacity = 0;
 
-      for (const u of next) tickDots(u, dt, playDamageSound);
+      for (const u of next) {
+        tickDots(u, dt, playDamageSound);
+        if (u.shield) {
+          u.shield.remaining -= dt;
+          if (u.shield.remaining <= 0 || u.shield.hp <= 0) u.shield = null;
+        }
+      }
+
+      s.bonusTimer -= dt;
+      for (const bonus of s.bonuses) bonus.age += dt;
+      if (s.bonuses.length === 0 && s.bonusTimer <= 0) {
+        s.bonuses.push(randomBonus());
+      }
+      let bonusPicked = false;
+      for (const bonus of s.bonuses) {
+        for (const u of next) {
+          if (u.hp <= 0) continue;
+          if (dist3(u, bonus) < (u.radius || BALL_RADIUS) + 0.32) {
+            applyBonus(u, bonus);
+            bonus.age = BONUS_VISIBLE_TIME + BONUS_FADE_TIME + 1;
+            bonusPicked = true;
+            playDamageSound("impact");
+            break;
+          }
+        }
+      }
+      const bonusExpired = s.bonuses.some(b => b.age >= BONUS_VISIBLE_TIME + BONUS_FADE_TIME);
+      if (bonusPicked) {
+        s.bonuses = [];
+        s.bonusTimer = BONUS_SPAWN_INTERVAL;
+      } else if (bonusExpired) {
+        s.bonuses = [randomBonus()];
+        s.bonusTimer = BONUS_SPAWN_INTERVAL;
+      }
 
       const newProj:    Projectile[] = [...s.projectiles];
       const spawnUnits: Unit[]       = [];
@@ -1632,8 +1886,15 @@ export default function ArenaSim() {
           for (const e of next) {
             if (e.team === u.team || e.hp <= 0) continue;
             const dx = e.x - wx, dz = e.z - wz;
-            if (Math.sqrt(dx * dx + dz * dz) < (e.radius || BALL_RADIUS) + 0.2)
+            if (Math.sqrt(dx * dx + dz * dz) < (e.radius || BALL_RADIUS) + 0.2) {
               applyDamage(e, def.swingDmg * dt, "melee", playDamageSound);
+              addBonusPoison(u, e);
+            }
+          }
+          for (const t of s.turrets) {
+            if (!t.alive || t.team === u.team) continue;
+            const dx = t.x - wx, dz = t.z - wz;
+            if (Math.sqrt(dx * dx + dz * dz) < 0.6) applyDamageToTurret(t, def.swingDmg * dt, playDamageSound, "melee");
           }
         }
 
@@ -1646,8 +1907,15 @@ export default function ArenaSim() {
           for (const e of next) {
             if (e.team === u.team || e.hp <= 0) continue;
             const dx = e.x - wx, dz = e.z - wz;
-            if (Math.sqrt(dx * dx + dz * dz) < (e.radius || BALL_RADIUS) + 0.22)
+            if (Math.sqrt(dx * dx + dz * dz) < (e.radius || BALL_RADIUS) + 0.22) {
               applyDamage(e, def.axeDmg, "melee", playDamageSound);
+              addBonusPoison(u, e);
+            }
+          }
+          for (const t of s.turrets) {
+            if (!t.alive || t.team === u.team) continue;
+            const dx = t.x - wx, dz = t.z - wz;
+            if (Math.sqrt(dx * dx + dz * dz) < 0.62) applyDamageToTurret(t, def.axeDmg, playDamageSound, "melee");
           }
         }
 
@@ -1669,11 +1937,13 @@ export default function ArenaSim() {
               const dx = nearestEnemy.x - u.x, dy = nearestEnemy.y - u.y, dz = nearestEnemy.z - u.z;
               const d  = Math.max(Math.sqrt(dx*dx + dy*dy + dz*dz), 0.01);
               const sp = def.spread;
+              const poisonDot = u.poisonCharges > 0 ? { duration: BONUS_POISON_DURATION, dmg: BONUS_POISON_DMG } : null;
+              if (poisonDot) u.poisonCharges--;
               newProj.push({ x:u.x, y:u.y, z:u.z,
                 vx:(dx/d + rnd(-sp,sp)) * def.projSpeed,
                 vy:(dy/d + rnd(0,0.25)) * def.projSpeed,
                 vz:(dz/d + rnd(-sp,sp)) * def.projSpeed,
-                gravity:def.gravity, dmg:def.projDmg, team:u.team, life:3.5, color:TEAM_HEX[u.team], dot:null, kind:"arrow" });
+                gravity:def.gravity, dmg:def.projDmg, team:u.team, life:3.5, color:TEAM_HEX[u.team], dot:poisonDot, kind:"arrow" });
             }
           }
         }
@@ -1705,6 +1975,15 @@ export default function ArenaSim() {
                   applyDamage(e, def.dmgPerSec * dt, "laser", playDamageSound);
               }
             }
+            for (const turret of s.turrets) {
+              if (!turret.alive || turret.team === u.team) continue;
+              const ex = turret.x - u.x, ez = turret.z - u.z;
+              const t = ex * rdx + ez * rdz;
+              if (t > 0 && t < 9) {
+                const px = ex - t * rdx, pz = ez - t * rdz;
+                if (Math.sqrt(px*px + pz*pz) < 0.5) applyDamageToTurret(turret, def.dmgPerSec * dt, playDamageSound, "laser");
+              }
+            }
           }
         }
 
@@ -1723,8 +2002,14 @@ export default function ArenaSim() {
           const hpRatio  = u.hp / u.maxHp;
           for (const e of next) {
             if (e.team === u.team || e.hp <= 0) continue;
-            if (dist3(u, e) < (u.radius || BALL_RADIUS) + (e.radius || BALL_RADIUS) + 0.3)
+            if (dist3(u, e) < (u.radius || BALL_RADIUS) + (e.radius || BALL_RADIUS) + 0.3) {
               applyDamage(e, def.crownDmg * dt, "melee", playDamageSound);
+              addBonusPoison(u, e);
+            }
+          }
+          for (const t of s.turrets) {
+            if (!t.alive || t.team === u.team) continue;
+            if (dist3(u, t) < (u.radius || BALL_RADIUS) + 0.55) applyDamageToTurret(t, def.crownDmg * dt, playDamageSound, "melee");
           }
           if (u.lastHpRatio - hpRatio >= def.recruitHpThreshold && spawnUnits.length < 6) {
             u.lastHpRatio = hpRatio;
@@ -1740,6 +2025,11 @@ export default function ArenaSim() {
             u.fireTimer = 1 / def.spearRate;
             if (nearestEnemy && nearestDist < def.spearRange + u.radius) {
               applyDamage(nearestEnemy, def.spearDmg, "melee", playDamageSound);
+              addBonusPoison(u, nearestEnemy);
+            }
+            for (const t of s.turrets) {
+              if (!t.alive || t.team === u.team) continue;
+              if (dist3(u, t) < def.spearRange + 0.35) applyDamageToTurret(t, def.spearDmg, playDamageSound, "melee");
             }
             if (nearestEnemy) {
               const dx = nearestEnemy.x - u.x, dz = nearestEnemy.z - u.z;
@@ -1769,9 +2059,15 @@ export default function ArenaSim() {
             const dx = e.x - wx, dz = e.z - wz;
             if (Math.sqrt(dx*dx + dz*dz) < (e.radius || BALL_RADIUS) + 0.18) {
               applyDamage(e, def.knifeDmg * dt, "melee", playDamageSound);
+              addBonusPoison(u, e);
               if (e.dots.filter(d => d.remaining > 0).length < 3)
                 e.dots.push({ remaining:def.dotDuration, dmg:def.dotDmg, tickTimer:0 });
             }
+          }
+          for (const t of s.turrets) {
+            if (!t.alive || t.team === u.team) continue;
+            const dx = t.x - wx, dz = t.z - wz;
+            if (Math.sqrt(dx*dx + dz*dz) < 0.58) applyDamageToTurret(t, def.knifeDmg * dt, playDamageSound, "melee");
           }
         }
 
@@ -1794,13 +2090,67 @@ export default function ArenaSim() {
                 // Update facing angle
                 u.orbitAngle = Math.atan2(dz, dx);
                 const sp = def.bulletSpread;
+                const poisonDot = u.poisonCharges > 0 ? { duration: BONUS_POISON_DURATION, dmg: BONUS_POISON_DMG } : null;
+                if (poisonDot) u.poisonCharges--;
                 newProj.push({ x:u.x, y:u.y + 0.15, z:u.z,
                   vx:(dx/d + rnd(-sp,sp)) * def.bulletSpeed,
                   vy:(dy/d + rnd(-sp*0.5,sp*0.5)) * def.bulletSpeed,
                   vz:(dz/d + rnd(-sp,sp)) * def.bulletSpeed,
-                  gravity:-2, dmg:def.bulletDmg, team:u.team, life:2.5, color:TEAM_HEX[u.team], dot:null, kind:"bullet" });
+                  gravity:-2, dmg:def.bulletDmg, team:u.team, life:2.5, color:TEAM_HEX[u.team], dot:poisonDot, kind:"bullet" });
               }
             }
+          }
+        }
+
+
+        if (u.type === "lina") {
+          const def = UNIT_DEFS.lina;
+          u.fireTimer -= dt;
+          u.burstTimer -= dt;
+          if (nearestEnemy) {
+            const dx = nearestEnemy.x - u.x, dz = nearestEnemy.z - u.z;
+            u.orbitAngle = Math.atan2(dz, dx);
+          }
+          if (u.fireTimer <= 0 && nearestEnemy) {
+            u.fireTimer = 1 / def.fireRate;
+            const dx = nearestEnemy.x - u.x, dy = nearestEnemy.y - u.y, dz = nearestEnemy.z - u.z;
+            const d = Math.max(Math.sqrt(dx*dx + dy*dy + dz*dz), 0.01);
+            const poisonDot = u.poisonCharges > 0 ? { duration: BONUS_POISON_DURATION, dmg: BONUS_POISON_DMG } : null;
+            if (poisonDot) u.poisonCharges--;
+            newProj.push({ x:u.x, y:u.y + 0.05, z:u.z,
+              vx:(dx/d) * def.projSpeed, vy:(dy/d) * def.projSpeed, vz:(dz/d) * def.projSpeed,
+              gravity:undefined, dmg:def.projDmg, team:u.team, life:2.6, color:0xff5522, dot:poisonDot, kind:"fireball", radius:0.22 });
+          }
+          if (u.burstTimer <= 0) {
+            u.burstTimer = def.waveInterval;
+            const a = rnd(0, Math.PI * 2);
+            newProj.push({ x:u.x, y:u.y, z:u.z,
+              vx:Math.cos(a) * def.waveSpeed, vy:rnd(-0.12, 0.12) * def.waveSpeed, vz:Math.sin(a) * def.waveSpeed,
+              gravity:undefined, dmg:def.waveDmg, team:u.team, life:1.9, color:0xff7722, dot:null, kind:"firewave", radius:0.42 });
+          }
+        }
+
+        if (u.type === "huskar") {
+          const def = UNIT_DEFS.huskar;
+          const missingRatio = 1 - u.hp / u.maxHp;
+          u.hp = clamp(u.hp + (u.maxHp - u.hp) * HUSKAR_MISSING_HP_REGEN_PER_SEC * dt, 0, u.maxHp);
+          const fireRate = def.baseFireRate + def.lowHpBonusRate * missingRatio;
+          u.fireTimer -= dt;
+          if (nearestEnemy) {
+            const dx = nearestEnemy.x - u.x, dz = nearestEnemy.z - u.z;
+            u.orbitAngle = Math.atan2(dz, dx);
+          } else {
+            u.orbitAngle += dt * 2;
+          }
+          if (u.fireTimer <= 0) {
+            u.fireTimer = 1 / fireRate;
+            const a = nearestEnemy ? Math.atan2(nearestEnemy.z - u.z, nearestEnemy.x - u.x) + rnd(-0.25, 0.25) : rnd(0, Math.PI * 2);
+            const poisonDot = u.poisonCharges > 0 ? { duration: BONUS_POISON_DURATION, dmg: BONUS_POISON_DMG } : null;
+            if (poisonDot) u.poisonCharges--;
+            newProj.push({ x:u.x, y:u.y + 0.05, z:u.z,
+              vx:Math.cos(a) * def.spearSpeed, vy:rnd(-0.12, 0.2) * def.spearSpeed, vz:Math.sin(a) * def.spearSpeed,
+              gravity:-1.2, dmg:def.spearDmg, team:u.team, life:2.8, color:0xff4422, dot:poisonDot, kind:"spear", radius:0.18 });
+            applyDamage(u, def.selfDmg, "dot", playDamageSound);
           }
         }
       }
@@ -1838,6 +2188,10 @@ export default function ArenaSim() {
             if (d < bombDef.bombRadius)
               applyDamage(u, bombDef.bombDmg, "explosion", playDamageSound);
           }
+          for (const t of s.turrets) {
+            if (!t.alive) continue;
+            if (dist3(t, bomb) < bombDef.bombRadius) applyDamageToTurret(t, bombDef.bombDmg, playDamageSound, "explosion");
+          }
           const fi = bi % MAX_BOMBS;
           explTimers[fi] = 0.45;
           explMeshes[fi].position.set(bomb.x, bomb.y, bomb.z);
@@ -1873,6 +2227,7 @@ export default function ArenaSim() {
           vis.weaponGroup.visible = false;
           vis.helmetGroup.visible = false;
           laserMeshes[i].visible = false;
+          shieldMeshes[i].visible = false;
           continue;
         }
 
@@ -1894,6 +2249,17 @@ export default function ArenaSim() {
         rebuildUnitVisuals(i, u);
 
         const hpRatio = u.hp / u.maxHp;
+
+        const sm = shieldMeshes[i];
+        if (u.shield) {
+          sm.visible = true;
+          sm.position.set(u.x, u.y, u.z);
+          sm.rotation.set(Math.PI / 2, globalTime * 2.5 + i, globalTime * 1.4);
+          sm.scale.setScalar(0.9 + (u.shield.hp / u.shield.maxHp) * 0.25);
+          (sm.material as THREE.MeshBasicMaterial).opacity = 0.3 + 0.45 * (u.shield.hp / u.shield.maxHp);
+        } else {
+          sm.visible = false;
+        }
 
         // Position outfits on ball
         vis.outfitGroup.visible = true;
@@ -2059,6 +2425,27 @@ export default function ArenaSim() {
             vis.helmetGroup.visible = false;
             break;
           }
+          case "lina": {
+            vis.weaponGroup.visible = false;
+            vis.helmetGroup.visible = true;
+            vis.helmetGroup.position.set(u.x, u.y + BALL_RADIUS * 0.55, u.z);
+            vis.helmetGroup.rotation.y = Math.sin(globalTime * 2) * 0.2;
+            break;
+          }
+          case "huskar": {
+            const spearR = 1.0;
+            vis.weaponGroup.visible = true;
+            vis.weaponGroup.position.set(
+              u.x + Math.cos(u.orbitAngle) * spearR,
+              u.y + 0.05,
+              u.z + Math.sin(u.orbitAngle) * spearR
+            );
+            vis.weaponGroup.rotation.y = -u.orbitAngle - Math.PI / 2;
+            vis.weaponGroup.rotation.z = Math.sin(globalTime * 7) * 0.15;
+            vis.helmetGroup.visible = true;
+            vis.helmetGroup.position.set(u.x, u.y + BALL_RADIUS * 0.55, u.z);
+            break;
+          }
           default:
             vis.weaponGroup.visible = false;
             vis.helmetGroup.visible = false;
@@ -2097,11 +2484,24 @@ export default function ArenaSim() {
           pm.lookAt(p.x + p.vx, p.y + p.vy, p.z + p.vz);
           const arrow = pm.getObjectByName("arrow") as THREE.Group | undefined;
           const bullet = pm.getObjectByName("bullet") as THREE.Mesh | undefined;
+          const fireball = pm.getObjectByName("fireball") as THREE.Mesh | undefined;
+          const spear = pm.getObjectByName("spear") as THREE.Group | undefined;
+          const wave = pm.getObjectByName("firewave") as THREE.Mesh | undefined;
           if (arrow) arrow.visible = p.kind === "arrow";
           if (bullet) {
-            bullet.visible = p.kind !== "arrow";
+            bullet.visible = p.kind === "bullet" || p.kind === "turret";
             (bullet.material as THREE.MeshBasicMaterial).color.setHex(p.color);
             bullet.scale.setScalar(p.kind === "bullet" ? 0.75 : 1);
+          }
+          if (fireball) {
+            fireball.visible = p.kind === "fireball";
+            fireball.scale.setScalar(1 + 0.22 * Math.sin(globalTime * 18));
+          }
+          if (spear) spear.visible = p.kind === "spear";
+          if (wave) {
+            wave.visible = p.kind === "firewave";
+            wave.rotation.z = globalTime * 5;
+            wave.scale.setScalar(1 + 0.5 * (1 - p.life / 1.9));
           }
         } else pm.visible = false;
       }
@@ -2156,6 +2556,34 @@ export default function ArenaSim() {
         } else { explMeshes[i].visible = false; }
       }
 
+      // ── Bonus meshes ──
+      for (let i = 0; i < MAX_BONUSES; i++) {
+        const bonus = s.bonuses[i];
+        const bm = bonusMeshes[i];
+        if (bonus) {
+          bm.visible = true;
+          bm.position.set(bonus.x, bonus.y + Math.sin(globalTime * 3) * 0.08, bonus.z);
+          bm.rotation.y = globalTime * 2;
+          const fading = bonus.age > BONUS_VISIBLE_TIME;
+          const fadeProgress = fading ? clamp((bonus.age - BONUS_VISIBLE_TIME) / BONUS_FADE_TIME, 0, 1) : 0;
+          const blink = fading ? (Math.sin(globalTime * 20) > 0 ? 1 : 0.28) : 1;
+          const opacity = (1 - fadeProgress) * blink;
+          bm.children.forEach(child => {
+            child.visible = child.name === bonus.type;
+            child.traverse(o => {
+              const mesh2 = o as THREE.Mesh;
+              if (mesh2.isMesh && mesh2.material) {
+                const mat = mesh2.material as THREE.Material & { opacity?: number; transparent?: boolean };
+                mat.transparent = true;
+                mat.opacity = opacity;
+              }
+            });
+          });
+        } else {
+          bm.visible = false;
+        }
+      }
+
       // ── HP state ──
       const aAvg = (() => { const a = next.filter(u => u.team === "A"); return a.length ? a.reduce((s2,u) => s2 + u.hp, 0) / a.length : 0; })();
       const bAvg = (() => { const a = next.filter(u => u.team === "B"); return a.length ? a.reduce((s2,u) => s2 + u.hp, 0) / a.length : 0; })();
@@ -2163,7 +2591,7 @@ export default function ArenaSim() {
         if (Math.abs(prev.A - aAvg) < 0.5 && Math.abs(prev.B - bAvg) < 0.5) return prev;
         return { A: aAvg, B: bAvg };
       });
-      setUnitHps(next.map(u => ({ type:u.type, team:u.team, hp:u.hp, maxHp:u.maxHp, dots:u.dots?.length || 0 })));
+      setUnitHps(next.map(u => ({ type:u.type, team:u.team, hp:u.hp, maxHp:u.maxHp, dots:u.dots?.length || 0, shieldHp:u.shield?.hp, poisonCharges:u.poisonCharges })));
 
       flashPlane.position.copy(camera.position);
       flashPlane.quaternion.copy(camera.quaternion);
@@ -2194,12 +2622,14 @@ export default function ArenaSim() {
     maxValue: number;
     color:    string;
     dots:     number;
+    shieldHp?: number;
+    poisonCharges?: number;
   }
 
-  const HpBar = ({ label, value, maxValue, color, dots }: HpBarProps) => (
+  const HpBar = ({ label, value, maxValue, color, dots, shieldHp, poisonCharges }: HpBarProps) => (
     <div style={{ marginBottom: 6 }}>
       <div style={{ display:"flex", justifyContent:"space-between", color:"#aabbcc", fontSize:9, letterSpacing:"0.06em", fontFamily:"'Courier New',monospace", marginBottom:2, textTransform:"uppercase" }}>
-        <span>{label}{dots > 0 ? <span style={{ color:"#44ff88", marginLeft:4 }}>●DOT</span> : ""}</span>
+        <span>{label}{dots > 0 ? <span style={{ color:"#44ff88", marginLeft:4 }}>●DOT</span> : ""}{shieldHp ? <span style={{ color:"#66ccff", marginLeft:4 }}>◆SH{Math.ceil(shieldHp)}</span> : ""}{poisonCharges ? <span style={{ color:"#aa44ff", marginLeft:4 }}>☠{poisonCharges}</span> : ""}</span>
         <span>{Math.round(value)}/{Math.round(maxValue || 100)}</span>
       </div>
       <div style={{ width:152, height:4, background:"#0d1a2a", borderRadius:2, overflow:"hidden", border:"1px solid #1a3050" }}>
@@ -2363,12 +2793,12 @@ export default function ArenaSim() {
           <div style={{ color:"#4488ff", fontSize:9, letterSpacing:"0.2em", ...mono, marginBottom:10, textTransform:"uppercase", opacity:0.65 }}>◈ ARENA SIM v4.0</div>
           <div style={{ color:"#4488ff", fontSize:8, letterSpacing:"0.15em", ...mono, marginBottom:6, opacity:0.45 }}>── {teamNames.A} · AVG {Math.round(hp.A)} ──</div>
           {unitHps.filter(u => u.team === "A").map((u, i) => (
-            <HpBar key={`a${i}`} label={`${TYPE_ICONS[u.type]} ${u.type}`} value={u.hp} maxValue={u.maxHp} color="#4488ff" dots={u.dots}/>
+            <HpBar key={`a${i}`} label={`${TYPE_ICONS[u.type]} ${u.type}`} value={u.hp} maxValue={u.maxHp} color="#4488ff" dots={u.dots} shieldHp={u.shieldHp} poisonCharges={u.poisonCharges}/>
           ))}
           <div style={{ borderTop:"1px solid #0d1a2a", margin:"8px 0" }}/>
           <div style={{ color:"#ff3344", fontSize:8, letterSpacing:"0.15em", ...mono, marginBottom:6, opacity:0.45 }}>── {teamNames.B} · AVG {Math.round(hp.B)} ──</div>
           {unitHps.filter(u => u.team === "B").map((u, i) => (
-            <HpBar key={`b${i}`} label={`${TYPE_ICONS[u.type]} ${u.type}`} value={u.hp} maxValue={u.maxHp} color="#ff3344" dots={u.dots}/>
+            <HpBar key={`b${i}`} label={`${TYPE_ICONS[u.type]} ${u.type}`} value={u.hp} maxValue={u.maxHp} color="#ff3344" dots={u.dots} shieldHp={u.shieldHp} poisonCharges={u.poisonCharges}/>
           ))}
           <div style={{ marginTop:8, fontSize:9, ...mono, color:colliding ? "#ffcc00" : "#1a3050", letterSpacing:"0.1em", transition:"color 0.1s", textAlign:"center" }}>
             {colliding ? "⚡ COLLISION" : "· NOMINAL ·"}
@@ -2385,7 +2815,7 @@ export default function ArenaSim() {
       </div>
 
       <div style={{ position:"absolute", bottom:0, left:0, right:0, padding:"7px 18px", background:"rgba(5,8,16,0.82)", borderTop:"1px solid #0d1a2a", display:"flex", justifyContent:"space-between", alignItems:"center", ...mono, fontSize:9, color:"#1a2a3a", letterSpacing:"0.1em" }}>
-        <span>ARENA 10×10×10 · 10 UNIT TYPES · TURRETS 30HP · SWORDSMAN ARMOR · THREE.JS</span>
+        <span>ARENA 10×10×10 · 12 UNIT TYPES · TURRETS 30HP · SWORDSMAN ARMOR · THREE.JS</span>
         <span style={{ color:colliding ? "#ffcc0055" : "#1a2a3a", transition:"color 0.2s" }}>{colliding ? "IMPACT DETECTED" : "TRACKING..."}</span>
       </div>
     </div>
